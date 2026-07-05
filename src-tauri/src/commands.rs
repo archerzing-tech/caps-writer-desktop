@@ -54,11 +54,12 @@ pub async fn send_audio_chunk(
     state: State<'_, AppState>,
     audio_data: Vec<f32>,
 ) -> Result<(), String> {
-    let duration = if audio_data.is_empty() {
-        0.0
-    } else {
-        audio_data.len() as f64 / 16000.0
-    };
+    // Short-circuit: no audio data to process
+    if audio_data.is_empty() {
+        return Ok(());
+    }
+
+    let duration = audio_data.len() as f64 / 16000.0;
 
     let port = {
         let p = state.server_port.lock().map_err(|e| e.to_string())?;
@@ -120,11 +121,13 @@ pub async fn stop_recording(
         *rec = RecordingState::Idle;
     }
 
-    let duration = if audio_data.is_empty() {
-        0.0
-    } else {
-        audio_data.len() as f64 / 16000.0
-    };
+    // Short-circuit: no audio data to process (e.g. realtime mode)
+    if audio_data.is_empty() {
+        let _ = app.emit("recording-state", "idle");
+        return Ok(());
+    }
+
+    let duration = audio_data.len() as f64 / 16000.0;
 
     let port = {
         let p = state.server_port.lock().map_err(|e| e.to_string())?;
@@ -139,7 +142,6 @@ pub async fn stop_recording(
         Ok(text) => text,
         Err(e) => {
             let _ = app.emit("server-log", format!("ASR request failed: {}", e));
-            // Fallback: use a meaningful message
             format!("[ASR offline] Audio: {:.1}s, {} samples", duration, audio_data.len())
         }
     };
