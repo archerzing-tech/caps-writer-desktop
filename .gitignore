@@ -43,3 +43,6 @@ screenshots/preview.html
 *.pdb
 *.exe
 *.msi
+
+# Large model files (>100MB, use Git LFS or distribute separately)
+models/
