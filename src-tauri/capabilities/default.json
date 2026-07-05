@@ -1,0 +1,44 @@
+{
+  "identifier": "default",
+  "description": "Default capability set for CapsWriter Desktop",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "shell:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "python",
+          "sidecar": false,
+          "args": true
+        },
+        {
+          "name": "python3",
+          "sidecar": false,
+          "args": true
+        }
+      ]
+    },
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "clipboard-manager:default",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
+    "fs:default",
+    "fs:allow-read",
+    "fs:allow-write",
+    "fs:allow-exists",
+    "fs:allow-mkdir"
+  ]
+}

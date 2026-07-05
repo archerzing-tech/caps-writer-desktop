@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tauri
+src-tauri/WixTools/
+src-tauri/Frameworks/
+
+# Logs
+*.log
+
+# Screenshots (dev only)
+screenshots/fullscreen.png
+screenshots/preview.html
+
+# User config (not committed)
+# CapsWriter Desktop stores config in %APPDATA%/caps-writer-desktop/
+
+# Misc
+*.pdb
+*.exe
+*.msi

@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CapsWriter Desktop · 语音输入</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Custom Title Bar -->
+  <header id="titlebar" data-tauri-drag-region>
+    <div class="titlebar-left">
+      <span class="titlebar-icon">◉</span>
+      <span class="titlebar-text">CapsWriter Desktop · 语音输入</span>
+    </div>
+    <div class="titlebar-center">
+      <span id="server-badge" class="status-badge offline">服务未连接</span>
+      <span id="server-retry" class="status-badge retry" style="display:none" title="重试连接">↻ 重试</span>
+      <span id="model-badge" class="status-badge">Qwen3-ASR</span>
+      <span id="lang-badge" class="status-badge">中文</span>
+    </div>
+    <div class="titlebar-right">
+      <button class="titlebar-btn" id="btn-minimize" title="最小化">─</button>
+      <button class="titlebar-btn" id="btn-hide" title="隐藏到托盘">⊟</button>
+      <button class="titlebar-btn" id="btn-close" title="退出">✕</button>
+    </div>
+  </header>
+
+  <!-- Sidebar Navigation -->
+  <nav id="sidebar">
+    <div class="sidebar-items">
+      <button class="sidebar-item active" data-view="record" title="语音输入">
+        <span class="sidebar-icon">🎙</span>
+        <span class="sidebar-label">语音</span>
+      </button>
+      <button class="sidebar-item" data-view="transcribe" title="文件转录">
+        <span class="sidebar-icon">📁</span>
+        <span class="sidebar-label">转录</span>
+      </button>
+      <button class="sidebar-item" data-view="history" title="历史记录">
+        <span class="sidebar-icon">📋</span>
+        <span class="sidebar-label">历史</span>
+      </button>
+      <button class="sidebar-item" data-view="settings" title="设置">
+        <span class="sidebar-icon">⚙</span>
+        <span class="sidebar-label">设置</span>
+      </button>
+    </div>
+    <div class="sidebar-footer">
+      <button class="sidebar-item" id="btn-tray-toggle" title="最小化到托盘">
+        <span class="sidebar-icon">⊟</span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- Main Content Area -->
+  <main id="content">
+    <!-- View: Record (default) -->
+    <section id="view-record" class="view active">
+      <div class="record-layout">
+        <!-- Left: Mic & Controls -->
+        <div class="record-controls">
+          <div class="mic-container">
+            <button id="mic-btn" class="mic-button" title="点击开始录音">
+              <div class="mic-ring" id="mic-ring-1"></div>
+              <div class="mic-ring" id="mic-ring-2"></div>
+              <div class="mic-inner">
+                <svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="2" width="6" height="11" rx="3"/>
+                  <path d="M5 10a7 7 0 0 0 14 0"/>
+                  <line x1="12" y1="19" x2="12" y2="22"/>
+                </svg>
+              </div>
+            </button>
+            <div class="mic-status" id="mic-status">就绪 · 点击录音</div>
+            <div class="mic-hint">点击麦克风图标，说出内容</div>
+            <div class="mic-waveform" id="waveform">
+              <canvas id="waveform-canvas" width="400" height="60"></canvas>
+            </div>
+          </div>
+
+          <!-- Quick Settings Bar -->
+          <div class="quick-bar">
+            <div class="quick-item">
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-paste" checked />
+                <span class="toggle-track"></span>
+              </label>
+              <span class="quick-label">自动粘贴</span>
+            </div>
+            <div class="quick-item">
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-hotwords" checked />
+                <span class="toggle-track"></span>
+              </label>
+              <span class="quick-label">热词替换</span>
+            </div>
+            <div class="quick-item">
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-llm" />
+                <span class="toggle-track"></span>
+              </label>
+              <span class="quick-label">LLM 润色</span>
+            </div>
+            <div class="quick-item">
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-translate" />
+                <span class="toggle-track"></span>
+              </label>
+              <span class="quick-label">自动翻译</span>
+            </div>
+            <div class="quick-item" id="shortcut-display">
+              <span class="key-hint">Mic</span>
+            </div>
+          </div>
+          
+          <!-- Translation Direction Toggle -->
+          <div class="translate-bar" id="translate-bar">
+            <div class="translate-dir-toggle">
+              <button class="translate-dir-btn active" data-dir="en2zh">英 → 中</button>
+              <button class="translate-dir-btn" data-dir="zh2en">中 → 英</button>
+            </div>
+            <span class="translate-label">翻译方向</span>
+          </div>
+        </div>
+
+        <!-- Right: Transcription Area -->
+        <div class="transcription-panel">
+          <div class="transcription-header">
+            <span class="panel-title">识别结果</span>
+            <div class="panel-actions">
+            <button class="action-btn" id="btn-copy" title="复制全部"><span class="action-btn-icon">📋</span> 复制全部</button>
+            <button class="action-btn danger" id="btn-clear" title="清空"><span class="action-btn-icon">🗑</span> 清空</button>
+          </div>
+          </div>
+          <div class="transcription-content" id="transcription-area">
+            <div class="placeholder-text">
+              <span class="placeholder-icon">◉</span>
+              <span>点击麦克风开始语音输入，结果将显示在这里</span>
+            </div>
+          </div>
+          <div class="transcription-footer">
+            <span id="char-count">0 字</span>
+            <span id="session-time">--</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- View: File Transcribe -->
+    <section id="view-transcribe" class="view">
+      <div class="transcribe-layout">
+        <div class="dropzone" id="dropzone">
+          <div class="dropzone-icon">📂</div>
+          <div class="dropzone-title">拖拽音频文件到此处</div>
+          <div class="dropzone-hint">支持 WAV, MP3, M4A, FLAC, OGG, AAC</div>
+          <button class="btn-primary" id="btn-pick-file">选择文件</button>
+        </div>
+        <div class="transcribe-progress" id="transcribe-progress" style="display:none">
+          <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <div class="progress-status" id="progress-status">正在转录...</div>
+        </div>
+        <div class="transcribe-result" id="transcribe-result" style="display:none">
+          <div class="result-actions">
+            <button class="action-btn" id="btn-export-srt">导出 SRT</button>
+            <button class="action-btn" id="btn-export-txt">导出 TXT</button>
+            <button class="action-btn" id="btn-export-json">导出 JSON</button>
+          </div>
+          <div class="result-text" id="transcribe-text"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- View: History -->
+    <section id="view-history" class="view">
+      <div class="history-layout">
+        <!-- Left: Sidebar with dates and search -->
+        <div class="history-sidebar">
+          <div class="history-search">
+            <input type="text" id="history-search-input" placeholder="搜索历史记录..." />
+          </div>
+          <div class="history-date-list" id="history-date-list">
+            <div class="history-loading">加载中...</div>
+          </div>
+        </div>
+        <!-- Right: Entries for selected date -->
+        <div class="history-content">
+          <div class="history-header" id="history-header">
+            <span class="history-date-title" id="history-date-title">选择日期查看</span>
+            <div class="history-header-actions">
+              <span class="history-count" id="history-count"></span>
+              <button class="action-btn danger" id="btn-clear-history" title="清空所有历史记录"><span class="action-btn-icon">🗑</span> 清空全部</button>
+            </div>
+          </div>
+          <div class="history-entries" id="history-entries">
+            <div class="placeholder-text">
+              <span class="placeholder-icon">📋</span>
+              <span>从左侧选择日期查看识别记录</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- View: Settings -->
+    <section id="view-settings" class="view">
+      <div class="settings-layout">
+        <nav class="settings-nav">
+          <button class="settings-tab active" data-tab="model">语音模型</button>
+          <button class="settings-tab" data-tab="shortcut">快捷键</button>
+          <button class="settings-tab" data-tab="hotword">热词管理</button>
+          <button class="settings-tab" data-tab="llm">LLM 角色</button>
+          <button class="settings-tab" data-tab="output">输出设置</button>
+          <button class="settings-tab" data-tab="about">关于</button>
+        </nav>
+        <div class="settings-content">
+          <!-- Model Settings -->
+          <div class="settings-pane active" id="tab-model">
+            <h3>语音模型</h3>
+            <div class="setting-group">
+              <label>识别引擎</label>
+              <select id="setting-model">
+                <option value="qwen_asr">Qwen3-ASR (最高精度)</option>
+              </select>
+            </div>
+            <div class="setting-group">
+              <label>识别语言</label>
+              <select id="setting-lang">
+                <option value="auto">自动检测</option>
+                <option value="chinese">中文</option>
+                <option value="english">英文</option>
+                <option value="japanese">日文</option>
+              </select>
+            </div>
+            <div class="setting-group">
+              <label class="checkbox-row">
+                <input type="checkbox" id="setting-format-num" checked />
+                <span>数字格式化（十五六个 → 15~16个）</span>
+              </label>
+            </div>
+            <div class="setting-group">
+              <label>GPU 加速</label>
+              <select id="setting-gpu">
+                <option value="cpu">CPU</option>
+                <option value="dml">DirectML (GPU)</option>
+              </select>
+            </div>
+            <button class="btn-primary" id="btn-save-model">应用模型设置</button>
+          </div>
+
+          <!-- Shortcut Settings -->
+          <div class="settings-pane" id="tab-shortcut">
+            <h3>快捷键设置</h3>
+            <div class="shortcut-list" id="shortcut-list">
+              <div class="shortcut-item">
+                <span class="shortcut-label">录音快捷键</span>
+                <div class="shortcut-keys">
+                  <kbd>Mic</kbd>
+                  <span class="shortcut-arrow">⇢</span>
+                  <span class="shortcut-action">按住录音</span>
+                </div>
+              </div>
+              <div class="shortcut-item">
+                <span class="shortcut-label">鼠标侧键</span>
+                <div class="shortcut-keys">
+                  <kbd>X2</kbd>
+                  <span class="shortcut-arrow">⇢</span>
+                  <span class="shortcut-action">按住录音</span>
+                </div>
+              </div>
+              <div class="shortcut-item">
+                <span class="shortcut-label">中断 LLM</span>
+                <div class="shortcut-keys">
+                  <kbd>Esc</kbd>
+                  <span class="shortcut-arrow">⇢</span>
+                  <span class="shortcut-action">中断输出</span>
+                </div>
+              </div>
+            </div>
+            <div class="setting-group">
+              <label>按键触发阈值</label>
+              <div class="slider-row">
+                <input type="range" id="setting-threshold" min="0.1" max="1.0" step="0.05" value="0.3" />
+                <span id="threshold-value">0.3s</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Hotword Settings -->
+          <div class="settings-pane" id="tab-hotword">
+            <h3>热词管理</h3>
+            <div class="setting-group">
+              <label>热词替换</label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="setting-hot-enabled" checked />
+                <span>启用热词替换 (RAG 匹配)</span>
+              </label>
+            </div>
+            <div class="setting-group">
+              <label>规则替换</label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="setting-rule-enabled" checked />
+                <span>启用正则规则替换</span>
+              </label>
+            </div>
+            <div class="hotword-editor">
+              <div class="editor-header">
+                <span>热词列表 (hotwords.txt)</span>
+                <div class="editor-actions">
+                  <button class="action-btn" id="btn-add-hotword">+ 添加</button>
+                  <button class="btn-primary btn-sm" id="btn-save-hotwords">💾 保存热词</button>
+                </div>
+              </div>
+              <textarea id="hotword-text" rows="8" placeholder="每行一个热词&#10;示例：&#10;深度学习&#10;自然语言处理&#10;CapsWriter&#10;大语言模型 -> LLM"></textarea>
+              <div class="hotword-info">热词格式：每行一个词，支持 "原词 -> 替换词" 格式进行替换</div>
+            </div>
+          </div>
+
+          <!-- LLM Settings -->
+          <div class="settings-pane" id="tab-llm">
+            <h3>LLM 润色</h3>
+            <div class="setting-group">
+              <label>翻译 API</label>
+              <select id="setting-llm-backend">
+                <option value="deepseek">DeepSeek (推荐)</option>
+                <option value="openai">OpenAI 兼容</option>
+                <option value="ollama">Ollama (本地)</option>
+              </select>
+            </div>
+            <div class="setting-group">
+              <label>API 地址</label>
+              <input type="text" id="setting-llm-url" placeholder="https://api.deepseek.com/v1" />
+            </div>
+            <div class="setting-group">
+              <label>模型名称</label>
+              <input type="text" id="setting-llm-model" placeholder="deepseek-chat" />
+            </div>
+            <div class="setting-group">
+              <label>API Key</label>
+              <input type="password" id="setting-llm-key" placeholder="sk-..." />
+            </div>
+            <div class="llm-actions">
+              <button class="btn-primary" id="btn-save-llm">保存 LLM 设置</button>
+              <button class="btn-secondary" id="btn-test-llm">🔌 测试连接</button>
+            </div>
+            <div id="llm-test-result" class="llm-test-result" style="display:none"></div>
+          </div>
+
+          <!-- Output Settings -->
+          <div class="settings-pane" id="tab-output">
+            <h3>输出设置</h3>
+            <div class="setting-group">
+              <label>末尾标点</label>
+              <input type="text" id="setting-trash-punc" value="，。,。" placeholder="要去除的末尾标点" />
+            </div>
+            <div class="setting-group">
+              <label class="checkbox-row">
+                <input type="checkbox" id="setting-save-audio" checked />
+                <span>保存录音文件</span>
+              </label>
+            </div>
+            <div class="setting-group">
+              <label class="checkbox-row">
+                <input type="checkbox" id="setting-paste" checked />
+                <span>自动粘贴识别结果</span>
+              </label>
+            </div>
+            <div class="setting-group">
+              <label class="checkbox-row">
+                <input type="checkbox" id="setting-restore-clip" checked />
+                <span>粘贴后恢复剪贴板</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- About -->
+          <div class="settings-pane" id="tab-about">
+            <h3>关于 CapsWriter Desktop</h3>
+            <div class="about-info">
+              <div class="about-version">版本 0.1.0</div>
+              <div class="about-desc">
+                基于 <a href="https://github.com/HaujetZhao/CapsWriter-Offline" target="_blank">CapsWriter-Offline</a> 构建的离线桌面语音输入工具。
+                完全离线运行，支持多种 ASR 引擎、热词替换、LLM 润色。
+              </div>
+              <div class="about-engine">
+                <div>引擎: sherpa-onnx</div>
+                <div>UI: Tauri + Web</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Toast Notifications -->
+  <div id="toast-container"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
