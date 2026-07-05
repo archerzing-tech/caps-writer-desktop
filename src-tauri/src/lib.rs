@@ -69,6 +69,7 @@ pub fn run() {
             stop_server,
             start_recording,
             stop_recording,
+            send_audio_chunk,
             get_recording_state,
             get_server_status,
             save_config,

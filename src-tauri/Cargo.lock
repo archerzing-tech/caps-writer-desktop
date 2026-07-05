@@ -301,7 +301,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "caps-writer-tauri"
+name = "caps-writer-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",

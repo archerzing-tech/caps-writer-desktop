@@ -16,6 +16,10 @@ pub struct AppConfig {
     pub save_audio: bool,
     pub trash_punc: String,
     pub gpu: String,
+    #[serde(default)]
+    pub realtime_enabled: bool,
+    #[serde(default)]
+    pub translate_direction: String,
 }
 
 impl Default for AppConfig {
@@ -30,6 +34,8 @@ impl Default for AppConfig {
             save_audio: true,
             trash_punc: "，。,.".into(),
             gpu: "cpu".into(),
+            realtime_enabled: false,
+            translate_direction: "auto".into(),
         }
     }
 }
@@ -39,6 +45,54 @@ pub fn get_server_status(state: State<'_, AppState>) -> Result<bool, String> {
     let val = *state.server_running.lock().map_err(|e| e.to_string())?;
     println!("[command] get_server_status = {}", val);
     Ok(val)
+}
+
+/// Send an audio chunk for realtime transcription (does not change recording state)
+#[tauri::command]
+pub async fn send_audio_chunk(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    audio_data: Vec<f32>,
+) -> Result<(), String> {
+    let duration = if audio_data.is_empty() {
+        0.0
+    } else {
+        audio_data.len() as f64 / 16000.0
+    };
+
+    let port = {
+        let p = state.server_port.lock().map_err(|e| e.to_string())?;
+        *p
+    };
+
+    // Send audio chunk to ASR server
+    let result_text = match send_audio_to_asr(&audio_data, port).await {
+        Ok(text) => text,
+        Err(e) => {
+            let _ = app.emit("server-log", format!("[Realtime] ASR chunk failed: {}", e));
+            return Ok(());
+        }
+    };
+
+    if result_text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    let _ = app.emit(
+        "transcription",
+        serde_json::json!({
+            "text": result_text,
+            "is_final": true,
+            "duration": duration,
+            "timestamp": now,
+        }),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -577,21 +631,44 @@ fn load_llm_settings() -> LlmSettings {
     }
 }
 
+/// Detect if text is primarily Chinese (returns true) or English (returns false)
+fn is_chinese_text(text: &str) -> bool {
+    let chinese_chars = text.chars().filter(|c| {
+        let cp = *c as u32;
+        (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
+    }).count();
+    let total_alphabetic = text.chars().filter(|c| c.is_alphabetic()).count();
+    if total_alphabetic == 0 && chinese_chars == 0 { return true; }
+    chinese_chars as f64 / (chinese_chars + total_alphabetic) as f64 > 0.3
+}
+
+/// Resolve translation direction: auto-detect or use explicit direction
+fn resolve_translate_direction(text: &str, direction: &str) -> &'static str {
+    match direction {
+        "zh2en" => "zh2en",
+        "en2zh" => "en2zh",
+        "auto" => {
+            if is_chinese_text(text) { "en2zh" } else { "zh2en" }
+        }
+        _ => "en2zh",
+    }
+}
+
 /// Translate text between Chinese and English using configured LLM
 #[tauri::command]
 pub async fn translate_text(request: TranslateRequest) -> Result<String, String> {
     let settings = load_llm_settings();
     
-    let (system_prompt, user_prompt) = match request.direction.as_str() {
+    let resolved = resolve_translate_direction(&request.text, &request.direction);
+    let (system_prompt, user_prompt) = match resolved {
         "zh2en" => (
             "You are a professional translator. Translate the following Chinese text to English. Output ONLY the translation, no explanations, no quotes.",
             format!("Chinese: {}\nEnglish:", request.text)
         ),
-        "en2zh" => (
+        _ => (
             "You are a professional translator. Translate the following English text to Chinese. Output ONLY the translation, no explanations, no quotes.",
             format!("English: {}\nChinese:", request.text)
         ),
-        _ => return Err("Invalid translation direction. Use 'zh2en' or 'en2zh'.".into()),
     };
     
     let client = reqwest::Client::builder()

@@ -109,6 +109,13 @@
               </label>
               <span class="quick-label">自动翻译</span>
             </div>
+            <div class="quick-item">
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-realtime" />
+                <span class="toggle-track"></span>
+              </label>
+              <span class="quick-label">实时转写</span>
+            </div>
             <div class="quick-item" id="shortcut-display">
               <span class="key-hint">Mic</span>
             </div>
@@ -117,7 +124,8 @@
           <!-- Translation Direction Toggle -->
           <div class="translate-bar" id="translate-bar">
             <div class="translate-dir-toggle">
-              <button class="translate-dir-btn active" data-dir="en2zh">英 → 中</button>
+              <button class="translate-dir-btn active" data-dir="auto">自动</button>
+              <button class="translate-dir-btn" data-dir="en2zh">英 → 中</button>
               <button class="translate-dir-btn" data-dir="zh2en">中 → 英</button>
             </div>
             <span class="translate-label">翻译方向</span>
@@ -365,6 +373,12 @@
               <label class="checkbox-row">
                 <input type="checkbox" id="setting-paste" checked />
                 <span>自动粘贴识别结果</span>
+              </label>
+            </div>
+            <div class="setting-group">
+              <label class="checkbox-row">
+                <input type="checkbox" id="setting-realtime" />
+                <span>实时语音转文字（说完一句话立即转换）</span>
               </label>
             </div>
             <div class="setting-group">

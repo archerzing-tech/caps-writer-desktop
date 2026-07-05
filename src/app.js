@@ -11,6 +11,7 @@ const state = {
   recording: false,
   serverOnline: false,
   transcriptions: [],
+  realtimeActive: false,
 };
 
 // --- MediaRecorder ---
@@ -82,21 +83,25 @@ async function startRecording() {
       }
       stopWaveform();
 
-      // Decode audio to float32 PCM
-      try {
-        const blob = new Blob(audioChunks, { type: mime });
-        const buf = await blob.arrayBuffer();
-        const actx = new AudioContext({ sampleRate: 16000 });
-        const decoded = await actx.decodeAudioData(buf);
-        const pcm = decoded.getChannelData(0);
-
-        // Send to Rust backend (convert Float32Array -> number[])
-        const arr = Array.from(pcm);
-        await invoke('stop_recording', { audioData: arr });
-        actx.close();
-      } catch (e) {
-        console.error('Decode error:', e);
-        await invoke('stop_recording', { audioData: [] });
+      if (state.realtimeActive) {
+        // Realtime mode: chunks already sent, just notify backend recording stopped
+        state.realtimeActive = false;
+        try { await invoke('stop_recording', { audioData: [] }); } catch (_) {}
+      } else {
+        // Standard mode: decode all audio and send at once
+        try {
+          const blob = new Blob(audioChunks, { type: mime });
+          const buf = await blob.arrayBuffer();
+          const actx = new AudioContext({ sampleRate: 16000 });
+          const decoded = await actx.decodeAudioData(buf);
+          const pcm = decoded.getChannelData(0);
+          const arr = Array.from(pcm);
+          await invoke('stop_recording', { audioData: arr });
+          actx.close();
+        } catch (e) {
+          console.error('Decode error:', e);
+          await invoke('stop_recording', { audioData: [] });
+        }
       }
 
       micStatus.textContent = '就绪 · 点击录音';
@@ -116,6 +121,12 @@ async function startRecording() {
     document.body.classList.add('recording-active');
     micStatus.textContent = '● 录音中... 点击停止';
     startWaveform();
+
+    // Realtime mode: periodically flush audio chunks
+    state.realtimeActive = $('#toggle-realtime')?.checked || $('#setting-realtime')?.checked;
+    if (state.realtimeActive) {
+      startRealtimeFlush();
+    }
   } catch (e) {
     micStatus.textContent = '麦克风访问失败';
     console.error(e);
@@ -125,6 +136,9 @@ async function startRecording() {
 }
 
 function stopRecording() {
+  // Stop realtime flush if active
+  stopRealtimeFlush();
+
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     mediaRecorder.stop();
   }
@@ -402,6 +416,8 @@ $('#btn-save-model')?.addEventListener('click', async () => {
     save_audio: $('#setting-save-audio')?.checked ?? true,
     trash_punc: $('#setting-trash-punc')?.value || '，,。。',
     gpu: $('#setting-gpu')?.value || 'cpu',
+    realtime_enabled: $('#setting-realtime')?.checked ?? false,
+    translate_direction: translateDir || 'auto',
   };
   try { await invoke('save_config', { config: c }); toast('✅ 设置已保存'); }
   catch (e) { toast(`保存失败: ${e}`, 'error'); }
@@ -866,7 +882,7 @@ async function exportTranscriptions(format) {
 }
 
 // === Translation ===
-let translateDir = 'en2zh'; // 'en2zh' or 'zh2en'
+let translateDir = 'auto'; // 'auto', 'en2zh' or 'zh2en'
 
 // Setup translation direction toggle
 function setupTranslateBar() {
@@ -985,6 +1001,14 @@ function syncQuickToggles() {
       await saveQuickSettings();
     });
   }
+  const realtimeToggle = $('#toggle-realtime');
+  if (realtimeToggle) {
+    realtimeToggle.addEventListener('change', async () => {
+      const settingRealtime = $('#setting-realtime');
+      if (settingRealtime) settingRealtime.checked = realtimeToggle.checked;
+      await saveQuickSettings();
+    });
+  }
 }
 
 async function saveQuickSettings() {
@@ -994,6 +1018,7 @@ async function saveQuickSettings() {
     c.paste_on_finish = $('#toggle-paste')?.checked ?? true;
     c.hotwords_enabled = $('#toggle-hotwords')?.checked ?? true;
     c.llm_enabled = $('#toggle-llm')?.checked ?? false;
+    c.realtime_enabled = $('#toggle-realtime')?.checked ?? false;
     await invoke('save_config', { config: c });
   } catch (_) {}
 }
@@ -1062,6 +1087,85 @@ function setupHotwordManagement() {
   window.__loadHotwords = loadHotwords;
 }
 
+// === Realtime Recording ===
+let realtimeFlushTimer = null;
+let realtimePcmBuffer = [];
+let realtimeMediaSource = null;
+let realtimeProcessor = null;
+let realtimeAudioCtx = null;
+
+function startRealtimeFlush() {
+  // Use ScriptProcessorNode to capture raw PCM at 16kHz
+  if (!mediaStream) return;
+
+  // Create a dedicated 16kHz AudioContext for realtime capture
+  const rtAudioContext = new AudioContext({ sampleRate: 16000 });
+  const source = rtAudioContext.createMediaStreamSource(mediaStream);
+  // 4096 samples buffer, 1 input channel, 1 output channel
+  realtimeProcessor = rtAudioContext.createScriptProcessor(4096, 1, 1);
+  realtimePcmBuffer = [];
+  realtimeAudioCtx = rtAudioContext;
+
+  realtimeProcessor.onaudioprocess = (e) => {
+    if (!state.recording) return;
+    const input = e.inputBuffer.getChannelData(0);
+    // Copy the float32 samples (already at 16kHz)
+    for (let i = 0; i < input.length; i++) {
+      realtimePcmBuffer.push(input[i]);
+    }
+  };
+
+  // Only connect for processing — do NOT connect to destination (prevents feedback loop)
+  source.connect(realtimeProcessor);
+  realtimeMediaSource = source;
+
+  // Flush every 3 seconds using send_audio_chunk (non-destructive)
+  realtimeFlushTimer = setInterval(async () => {
+    if (realtimePcmBuffer.length === 0) return;
+    const chunk = realtimePcmBuffer;
+    realtimePcmBuffer = [];
+    const duration = chunk.length / 16000;
+    if (duration < 0.5) return; // skip very short chunks
+
+    try {
+      await invoke('send_audio_chunk', { audioData: chunk });
+    } catch (e) {
+      console.warn('[Realtime] flush failed:', e);
+    }
+  }, 3000);
+
+  micStatus.textContent = '● 实时转写中... 点击停止';
+}
+
+function stopRealtimeFlush() {
+  if (realtimeFlushTimer) {
+    clearInterval(realtimeFlushTimer);
+    realtimeFlushTimer = null;
+  }
+  if (realtimeProcessor) {
+    realtimeProcessor.disconnect();
+    realtimeProcessor = null;
+  }
+  if (realtimeMediaSource) {
+    realtimeMediaSource.disconnect();
+    realtimeMediaSource = null;
+  }
+  if (realtimeAudioCtx) {
+    realtimeAudioCtx.close().catch(() => {});
+    realtimeAudioCtx = null;
+  }
+  // Send any remaining buffered PCM
+  if (realtimePcmBuffer.length > 0) {
+    const remaining = realtimePcmBuffer;
+    realtimePcmBuffer = [];
+    const duration = remaining.length / 16000;
+    if (duration >= 0.3) {
+      invoke('send_audio_chunk', { audioData: remaining }).catch(() => {});
+    }
+  }
+  realtimePcmBuffer = [];
+}
+
 // === Init ===
 async function loadSettings() {
   try {
@@ -1074,9 +1178,19 @@ async function loadSettings() {
     sc('toggle-llm', c.llm_enabled); sc('setting-paste', c.paste_on_finish);
     sc('setting-save-audio', c.save_audio); sv('setting-trash-punc', c.trash_punc);
     sv('setting-gpu', c.gpu || 'cpu');
+    sc('setting-realtime', c.realtime_enabled || false);
     // Sync quick bar toggles
     sc('toggle-paste', c.paste_on_finish);
     sc('toggle-hotwords', c.hotwords_enabled);
+    sc('toggle-realtime', c.realtime_enabled || false);
+    // Sync translate direction
+    translateDir = c.translate_direction || 'auto';
+    const translateBar = $('#translate-bar');
+    if (translateBar) {
+      translateBar.querySelectorAll('.translate-dir-btn').forEach((b) => {
+        b.classList.toggle('active', b.dataset.dir === translateDir);
+      });
+    }
   } catch (_) {}
 
   // Load LLM settings into the form
@@ -1126,6 +1240,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('#setting-hot-enabled')?.addEventListener('change', () => {
     const toggle = $('#toggle-hotwords');
     if (toggle) toggle.checked = $('#setting-hot-enabled').checked;
+  });
+  $('#setting-realtime')?.addEventListener('change', () => {
+    const toggle = $('#toggle-realtime');
+    if (toggle) toggle.checked = $('#setting-realtime').checked;
   });
 
   // Setup translation bar
