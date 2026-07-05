@@ -84,8 +84,15 @@ async function startRecording() {
       stopWaveform();
 
       if (state.realtimeActive) {
+        // Save accumulated realtime text to history before clearing state
+        const rtText = state.transcriptions[0]?.text || '';
+        if (rtText.trim().length > 0) {
+          const rtTs = state.transcriptions[0]?.time || (Date.now() / 1000);
+          autoSaveHistory(rtText, rtTs, 0);
+        }
         // Realtime mode: chunks already sent, just notify backend recording stopped
         state.realtimeActive = false;
+        realtimeCardEl = null; // Done building this card
         try { await invoke('stop_recording', { audioData: [] }); } catch (_) {}
       } else {
         // Standard mode: decode all audio and send at once
@@ -223,11 +230,36 @@ function drawIdle() {
 drawIdle();
 
 // === Transcription ===
+let realtimeCardEl = null; // Current realtime card being built
+
 listen('transcription', (e) => {
   const d = e.payload;
-  addTrans(d.text, d.is_final, d.duration, d.timestamp);
-  // Auto-save to history
-  autoSaveHistory(d.text, d.timestamp, d.duration || 0);
+  // Skip empty/whitespace-only results (e.g. from stop_recording with empty audio)
+  if (!d.text || d.text.trim().length === 0) return;
+  if (state.realtimeActive && realtimeCardEl) {
+    // Realtime mode: append text to the current card
+    const textEl = realtimeCardEl.querySelector('.entry-text');
+    if (textEl && d.text && d.text.trim().length > 0) {
+      const prev = textEl.textContent;
+      textEl.textContent = prev ? prev + d.text : d.text;
+      // Update the stored text in state for copy/delete
+      const idx = state.transcriptions.findIndex(t => t.time === realtimeCardEl.dataset.time);
+      if (idx !== -1) state.transcriptions[idx].text = textEl.textContent;
+      // Update duration display
+      const timeEl = realtimeCardEl.querySelector('.entry-time');
+      if (timeEl) timeEl.textContent = new Date(d.timestamp * 1000).toLocaleTimeString() + ' · ' + (d.duration || 0).toFixed(1) + 's';
+      const total = state.transcriptions.reduce((s, t) => s + t.text.length, 0);
+      const el2 = $('#char-count');
+      if (el2) el2.textContent = total + ' 字';
+    }
+    // Skip per-chunk history save in realtime mode (save full text on stop)
+  } else if (!state.realtimeActive) {
+    // Standard mode: create a new card
+    addTrans(d.text, d.is_final, d.duration, d.timestamp);
+    // Auto-save to history
+    autoSaveHistory(d.text, d.timestamp, d.duration || 0);
+  }
+  // If realtime but no card (deleted mid-recording), silently discard the chunk
 });
 
 function addTrans(text, isFinal, dur, ts) {
@@ -1098,6 +1130,58 @@ function startRealtimeFlush() {
   // Use ScriptProcessorNode to capture raw PCM at 16kHz
   if (!mediaStream) return;
 
+  // Create a single card for this realtime session
+  const area = $('#transcription-area');
+  const ph = area?.querySelector('.placeholder-text');
+  if (ph) ph.remove();
+
+  const now = Date.now() / 1000;
+  const t = new Date().toLocaleTimeString();
+  const el = document.createElement('div');
+  el.className = 'trans-entry';
+  el.dataset.time = now;
+  el.innerHTML = `
+    <div class="entry-header">
+      <span class="entry-time">${t} · 0.0s</span>
+      <button class="entry-btn-del" data-del>✕</button>
+    </div>
+    <div class="entry-text"></div>
+    <div class="entry-meta">
+      <div class="entry-actions">
+        <button class="entry-btn" data-copy>复制</button>
+        <button class="entry-btn" data-paste>粘贴</button>
+        <button class="entry-btn translate-btn" data-translate>翻译</button>
+      </div>
+    </div>`;
+  area?.prepend(el);
+  realtimeCardEl = el;
+  state.transcriptions.unshift({ text: '', time: now });
+
+  el.querySelector('[data-copy]')?.addEventListener('click', () => {
+    const text = el.querySelector('.entry-text')?.textContent || '';
+    navigator.clipboard.writeText(text);
+    toast('✅ 已复制');
+  });
+  el.querySelector('[data-paste]')?.addEventListener('click', async () => {
+    const text = el.querySelector('.entry-text')?.textContent || '';
+    await invoke('copy_to_clipboard', { text });
+    toast('✅ 已粘贴到当前窗口');
+  });
+  el.querySelector('[data-del]')?.addEventListener('click', () => {
+    const idx = state.transcriptions.findIndex(t => t.time === now);
+    if (idx !== -1) state.transcriptions.splice(idx, 1);
+    el.remove();
+    if (realtimeCardEl === el) realtimeCardEl = null;
+    const total = state.transcriptions.reduce((s, t) => s + t.text.length, 0);
+    const el2 = $('#char-count');
+    if (el2) el2.textContent = total + ' 字';
+    toast('🗑 已删除');
+  });
+
+  const total = state.transcriptions.reduce((s, t) => s + t.text.length, 0);
+  const el2 = $('#char-count');
+  if (el2) el2.textContent = total + ' 字';
+
   // Create a dedicated 16kHz AudioContext for realtime capture
   const rtAudioContext = new AudioContext({ sampleRate: 16000 });
   const source = rtAudioContext.createMediaStreamSource(mediaStream);
@@ -1109,14 +1193,18 @@ function startRealtimeFlush() {
   realtimeProcessor.onaudioprocess = (e) => {
     if (!state.recording) return;
     const input = e.inputBuffer.getChannelData(0);
-    // Copy the float32 samples (already at 16kHz)
     for (let i = 0; i < input.length; i++) {
       realtimePcmBuffer.push(input[i]);
     }
   };
 
-  // Only connect for processing — do NOT connect to destination (prevents feedback loop)
+  // Connect through processor to a silent GainNode (gain=0) as sink.
+  // ScriptProcessorNode requires a downstream connection to fire onaudioprocess.
+  const silentSink = rtAudioContext.createGain();
+  silentSink.gain.value = 0;
   source.connect(realtimeProcessor);
+  realtimeProcessor.connect(silentSink);
+  silentSink.connect(rtAudioContext.destination);
   realtimeMediaSource = source;
 
   // Flush every 3 seconds using send_audio_chunk (non-destructive)
@@ -1125,8 +1213,11 @@ function startRealtimeFlush() {
     const chunk = realtimePcmBuffer;
     realtimePcmBuffer = [];
     const duration = chunk.length / 16000;
-    if (duration < 0.5) return; // skip very short chunks
-
+    if (duration < 0.5) {
+      // Too short — put data back so it accumulates with future audio
+      realtimePcmBuffer = chunk;
+      return;
+    }
     try {
       await invoke('send_audio_chunk', { audioData: chunk });
     } catch (e) {

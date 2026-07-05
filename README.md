@@ -125,7 +125,7 @@
 - **`CapsWriter-Desktop_0.1.0_x64-setup.exe`** — NSIS 安装程序（推荐）
 - **`CapsWriter-Desktop_0.1.0_x64_en-US.msi`** — MSI 安装程序
 
-> ⚠️ 首次运行需要安装 Python 依赖（见下方 [Python 环境准备](#python-环境准备)）。模型文件已包含在仓库的 `models/` 目录中，无需额外下载。
+> ⚠️ 首次运行需要下载模型文件和安装 Python 依赖（见下方 [模型下载](#模型下载) 和 [Python 环境准备](#python-环境准备)）。
 
 ### 方式二：从源码构建
 
@@ -137,6 +137,25 @@
 | [Rust](https://rustup.rs) | ≥ 1.70 | Tauri 后端编译 |
 | [Python](https://python.org) | ≥ 3.10 | ASR 推理服务 |
 | [Tauri CLI](https://tauri.app) | 2.x | `cargo install tauri-cli` |
+
+#### 模型下载
+
+模型文件较大（约 600MB），已从 Git 仓库中排除，请手动下载并放置到 `models/` 目录：
+
+📥 **百度网盘下载**: https://pan.baidu.com/s/18n5K6q6Jq-xo7RK68wXCmQ?pwd=6666
+
+下载后解压到项目根目录，确保目录结构如下：
+
+```
+caps-writer-desktop/
+├── models/
+│   └── sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/
+│       ├── conv_frontend.onnx
+│       ├── encoder.int8.onnx
+│       ├── decoder.int8.onnx
+│       └── tokenizer/
+└── ...
+```
 
 #### 克隆并构建
 
