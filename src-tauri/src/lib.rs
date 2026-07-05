@@ -84,6 +84,7 @@ pub fn run() {
             delete_history_entry,
             clear_all_history,
             translate_text,
+            polish_text,
             test_llm_connection,
             save_llm_config,
             load_llm_config,

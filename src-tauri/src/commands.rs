@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub realtime_enabled: bool,
     #[serde(default)]
     pub translate_direction: String,
+    #[serde(default)]
+    pub translate_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -36,6 +38,7 @@ impl Default for AppConfig {
             gpu: "cpu".into(),
             realtime_enabled: false,
             translate_direction: "auto".into(),
+            translate_enabled: false,
         }
     }
 }
@@ -650,17 +653,72 @@ fn resolve_translate_direction(text: &str, direction: &str) -> &'static str {
         "zh2en" => "zh2en",
         "en2zh" => "en2zh",
         "auto" => {
-            if is_chinese_text(text) { "en2zh" } else { "zh2en" }
+            // If text is Chinese, translate to English (zh2en)
+            // If text is English/other, translate to Chinese (en2zh)
+            if is_chinese_text(text) { "zh2en" } else { "en2zh" }
         }
         _ => "en2zh",
     }
+}
+
+/// Send a chat completion request to the configured LLM and return the response content.
+/// Shared helper for translate_text, polish_text, and test_llm_connection.
+async fn llm_request(
+    settings: &LlmSettings,
+    system_prompt: &str,
+    user_prompt: &str,
+    timeout_secs: u64,
+    max_tokens: u32,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+    let api_url = settings.api_url.trim_end_matches('/').to_string() + "/chat/completions";
+
+    let body = serde_json::json!({
+        "model": settings.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    });
+
+    let mut req = client.post(&api_url).json(&body);
+    if !settings.api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", settings.api_key));
+    }
+
+    let response = req.send().await.map_err(|e| format!("LLM请求失败: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(format!("LLM返回错误 ({}): {}", status, body_text));
+    }
+
+    let data: serde_json::Value = response.json().await.map_err(|e| format!("解析响应失败: {}", e))?;
+
+    let content = data["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if content.is_empty() {
+        return Err("LLM返回了空结果".into());
+    }
+
+    Ok(content)
 }
 
 /// Translate text between Chinese and English using configured LLM
 #[tauri::command]
 pub async fn translate_text(request: TranslateRequest) -> Result<String, String> {
     let settings = load_llm_settings();
-    
+
     let resolved = resolve_translate_direction(&request.text, &request.direction);
     let (system_prompt, user_prompt) = match resolved {
         "zh2en" => (
@@ -672,51 +730,8 @@ pub async fn translate_text(request: TranslateRequest) -> Result<String, String>
             format!("English: {}\nChinese:", request.text)
         ),
     };
-    
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
-    let api_url = settings.api_url.trim_end_matches('/').to_string() + "/chat/completions";
-    
-    let body = serde_json::json!({
-        "model": settings.model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.1,
-        "max_tokens": 1024,
-    });
-    
-    let mut req = client.post(&api_url).json(&body);
-    
-    // Add authorization header if API key is set
-    if !settings.api_key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", settings.api_key));
-    }
-    
-    let response = req.send().await.map_err(|e| format!("LLM请求失败: {}", e))?;
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        return Err(format!("LLM返回错误 ({}): {}", status, body_text));
-    }
-    
-    let data: serde_json::Value = response.json().await.map_err(|e| format!("解析响应失败: {}", e))?;
-    
-    let translation = data["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    
-    if translation.is_empty() {
-        return Err("LLM返回了空结果".into());
-    }
-    
-    Ok(translation)
+
+    llm_request(&settings, &system_prompt, &user_prompt, 30, 1024).await
 }
 
 /// Test LLM connection by sending a minimal request
@@ -779,6 +794,27 @@ pub fn save_llm_config(settings: LlmSettings) -> Result<(), String> {
 #[tauri::command]
 pub fn load_llm_config() -> Result<LlmSettings, String> {
     Ok(load_llm_settings())
+}
+
+// ============================================================
+// LLM Polish: Punctuation + Sentence Segmentation + Typo Fix
+// ============================================================
+
+/// Polish ASR transcription text using LLM: fix punctuation, sentence breaks, typos.
+#[tauri::command]
+pub async fn polish_text(text: String) -> Result<String, String> {
+    let settings = load_llm_settings();
+
+    let system_prompt = "你是一个专业的语音识别文本润色助手。请对以下语音识别结果进行润色：\n\
+1. 修正标点符号（添加缺失的句号、逗号、问号等，修正错误的标点）\n\
+2. 合理断句（将长句分割为合理的短句，按语义分段）\n\
+3. 修正错别字和常见的语音识别错误（同音字、近音字等）\n\
+\n要求：\n\
+- 保持原意不变，不要添加或删除实质性内容\n\
+- 不要改变说话人的语气和风格\n\
+- 直接输出润色后的文本，不要添加任何解释、注释或额外内容";
+
+    llm_request(&settings, system_prompt, &text, 60, 4096).await
 }
 
 // ============================================================

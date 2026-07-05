@@ -5,6 +5,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getVersion } from '@tauri-apps/api/app';
 
 // --- State ---
 const state = {
@@ -12,6 +13,8 @@ const state = {
   serverOnline: false,
   transcriptions: [],
   realtimeActive: false,
+  processingEnded: false,  // prevents late transcription events from creating duplicates
+  historySavedForSession: false, // tracks whether onstop already saved history
 };
 
 // --- MediaRecorder ---
@@ -83,13 +86,83 @@ async function startRecording() {
       }
       stopWaveform();
 
+      // Reset per-session flags
+      state.historySavedForSession = false;
+
       if (state.realtimeActive) {
-        // Save accumulated realtime text to history before clearing state
-        const rtText = state.transcriptions[0]?.text || '';
-        if (rtText.trim().length > 0) {
-          const rtTs = state.transcriptions[0]?.time || (Date.now() / 1000);
-          autoSaveHistory(rtText, rtTs, 0);
+        const cardEl = realtimeCardEl; // Keep reference for polishing
+        // Look up the matching transcription by dataset.time, not by index 0
+        const rtIdx = cardEl ? state.transcriptions.findIndex(t => String(t.time) === cardEl.dataset.time) : -1;
+        const rtText = rtIdx !== -1 ? state.transcriptions[rtIdx].text : (state.transcriptions[0]?.text || '');
+        const rtTs = rtIdx !== -1 ? state.transcriptions[rtIdx].time : (state.transcriptions[0]?.time || (Date.now() / 1000));
+        const rtDuration = (Date.now() / 1000) - rtTs;
+
+        // Check if LLM polishing is enabled (`toggle-llm` quick toggle)
+        const llmEnabled = $('#toggle-llm')?.checked;
+        let finalText = rtText;
+
+        if (llmEnabled && rtText.trim().length > 0) {
+          // Quick check: is LLM configured?
+          let llmConfigured = true;
+          try {
+            const llm = await invoke('load_llm_config');
+            if (!llm.api_key || llm.api_key.trim() === '') {
+              llmConfigured = false;
+              toast('⚠ LLM 未配置，润色已跳过。请到设置中配置 LLM API Key', 'warning');
+            }
+          } catch (_) {}
+          
+          if (!llmConfigured) {
+            finalText = rtText;
+          } else {
+            micStatus.textContent = '✨ 润色中...';
+            try {
+              const polished = await invoke('polish_text', { text: rtText });
+              if (polished && polished.trim() !== rtText.trim()) {
+                finalText = polished;
+                // Update the card text with polished version
+                if (cardEl) {
+                  const textEl = cardEl.querySelector('.entry-text');
+                  if (textEl) textEl.textContent = polished;
+                  // Add polished badge
+                  const meta = cardEl.querySelector('.entry-meta');
+                  if (meta) {
+                    const badge = document.createElement('span');
+                    badge.className = 'polish-badge';
+                    badge.textContent = '✨ 已润色';
+                    meta.prepend(badge);
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn('[Polish] LLM polish failed:', e);
+            }
+          }
         }
+
+        // Save final text (polished or original) to history with actual duration
+        if (finalText.trim().length > 0) {
+          autoSaveHistory(finalText, rtTs, Math.max(0, rtDuration));
+        }
+        // Update state with final text
+        if (cardEl) {
+          const idx = state.transcriptions.findIndex(t => t.time === cardEl.dataset.time);
+          if (idx !== -1) state.transcriptions[idx].text = finalText;
+        }
+        // Update char count
+        const total = state.transcriptions.reduce((s, t) => s + t.text.length, 0);
+        const el2 = $('#char-count');
+        if (el2) el2.textContent = total + ' 字';
+
+        // Enable translate button now that recording is done
+        if (cardEl) {
+          const tBtn = cardEl.querySelector('[data-translate]');
+          if (tBtn) tBtn.disabled = false;
+        }
+
+        // Mark history as saved for this session (prevents duplicate saves from late events)
+        state.historySavedForSession = true;
+
         // Realtime mode: chunks already sent, just notify backend recording stopped
         state.realtimeActive = false;
         realtimeCardEl = null; // Done building this card
@@ -106,16 +179,49 @@ async function startRecording() {
           await invoke('stop_recording', { audioData: arr });
           actx.close();
         } catch (e) {
-          console.error('Decode error:', e);
+          console.error('[History] Audio decode/ASR failed:', e);
+          // Fallback: if ASR fails, save whatever text was accumulated in the UI
+          const fallbackText = state.transcriptions[0]?.text?.trim();
+          if (fallbackText) {
+            const now = Date.now() / 1000;
+            autoSaveHistory(fallbackText, now, 0);
+            state.historySavedForSession = true;
+            toast('⚠ ASR 处理失败，已保存当前文本', 'warning');
+          }
           await invoke('stop_recording', { audioData: [] });
         }
+
+        // Fallback safe: if the transcription event hasn't arrived yet, save
+        // whatever accumulated text we have from the UI after a short delay.
+        // This ensures history is always saved even if the event is delayed/lost.
+        setTimeout(() => {
+          if (!state.historySavedForSession) {
+            const pendingText = state.transcriptions[0]?.text?.trim();
+            if (pendingText) {
+              const now = Date.now() / 1000;
+              autoSaveHistory(pendingText, now, 0);
+              state.historySavedForSession = true;
+            }
+          }
+        }, 2000);
+      }
+
+      // Signal that main processing in onstop is done.
+      // Late-arriving transcription events will check this flag.
+      state.processingEnded = true;
+
+      // Close shared audioContext now that recording is fully done
+      if (audioContext) {
+        audioContext.close().catch(() => {});
+        audioContext = null;
+        analyserNode = null;
       }
 
       micStatus.textContent = '就绪 · 点击录音';
     };
 
-    // Analyser for waveform
-    audioContext = new AudioContext();
+    // Analyser for waveform (use 16kHz to match mic constraints; also reused by realtime)
+    audioContext = new AudioContext({ sampleRate: 16000 });
     const src = audioContext.createMediaStreamSource(mediaStream);
     analyserNode = audioContext.createAnalyser();
     analyserNode.fftSize = 256;
@@ -134,11 +240,18 @@ async function startRecording() {
     if (state.realtimeActive) {
       startRealtimeFlush();
     }
+    // Reset processing flag for new recording
+    state.processingEnded = false;
   } catch (e) {
     micStatus.textContent = '麦克风访问失败';
     console.error(e);
     if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
     mediaStream = null;
+    if (audioContext) {
+      audioContext.close().catch(() => {});
+      audioContext = null;
+      analyserNode = null;
+    }
   }
 }
 
@@ -236,6 +349,26 @@ listen('transcription', (e) => {
   const d = e.payload;
   // Skip empty/whitespace-only results (e.g. from stop_recording with empty audio)
   if (!d.text || d.text.trim().length === 0) return;
+
+  // If processing has ended, this is a late-arriving event (race condition).
+  // In realtime mode, the full text was already saved by onstop.
+  // In standard mode, we still process it (addTrans + autoSaveHistory) since
+  // it's the normal flow — but only if history hasn't been saved yet for this session.
+  if (state.processingEnded && !state.realtimeActive) {
+    // Standard mode, but processing ended: transcription event arrived late.
+    // Still save it to be safe, but mark it.
+    addTrans(d.text, d.is_final, d.duration, d.timestamp);
+    if (!state.historySavedForSession) {
+      autoSaveHistory(d.text, d.timestamp, d.duration || 0);
+    }
+    return;
+  }
+
+  // If processing ended and realtimeActive was true (late chunk result), discard silently
+  if (state.processingEnded && state.realtimeActive) {
+    return;
+  }
+
   if (state.realtimeActive && realtimeCardEl) {
     // Realtime mode: append text to the current card
     const textEl = realtimeCardEl.querySelector('.entry-text');
@@ -253,11 +386,12 @@ listen('transcription', (e) => {
       if (el2) el2.textContent = total + ' 字';
     }
     // Skip per-chunk history save in realtime mode (save full text on stop)
-  } else if (!state.realtimeActive) {
+  } else if (!state.realtimeActive && !state.historySavedForSession) {
     // Standard mode: create a new card
     addTrans(d.text, d.is_final, d.duration, d.timestamp);
-    // Auto-save to history
+    // Auto-save to history (mark session saved to prevent setTimeout/race dupes)
     autoSaveHistory(d.text, d.timestamp, d.duration || 0);
+    state.historySavedForSession = true;
   }
   // If realtime but no card (deleted mid-recording), silently discard the chunk
 });
@@ -938,6 +1072,22 @@ async function translateText(text) {
     return null;
   }
   
+  // Check if LLM is configured before attempting translation
+  try {
+    const llm = await invoke('load_llm_config');
+    if (!llm.api_key || llm.api_key.trim() === '') {
+      toast('⚠ 请先在设置中配置 LLM API Key', 'warning');
+      // Navigate to Settings → LLM tab
+      const sidebarBtn = document.querySelector('.sidebar-item[data-view="settings"]');
+      if (sidebarBtn) sidebarBtn.click();
+      const llmTab = document.querySelector('.settings-tab[data-tab="llm"]');
+      if (llmTab) llmTab.click();
+      return null;
+    }
+  } catch (_) {
+    // If we can't load config, just attempt the translation
+  }
+  
   try {
     const result = await invoke('translate_text', {
       request: {
@@ -953,15 +1103,29 @@ async function translateText(text) {
 }
 
 // Clear all history
+let clearConfirmPending = false;
+let clearConfirmTimer = null;
+
 function setupClearHistory() {
   const btn = $('#btn-clear-history');
   if (!btn) return;
   
   btn.addEventListener('click', async () => {
-    // Confirmation via toast with custom handling
-    if (!confirm('确定要清空所有历史记录吗？此操作不可撤销。')) {
+    // Double-click confirmation pattern (avoids relying on window.confirm)
+    if (!clearConfirmPending) {
+      clearConfirmPending = true;
+      toast('⚠ 再次点击确认清空所有历史记录', 'warning');
+      clearConfirmTimer = setTimeout(() => { clearConfirmPending = false; }, 4000);
       return;
     }
+    
+    // Clear pending state
+    clearConfirmPending = false;
+    if (clearConfirmTimer) {
+      clearTimeout(clearConfirmTimer);
+      clearConfirmTimer = null;
+    }
+    
     try {
       await invoke('clear_all_history');
       toast('🗑 已清空所有历史记录');
@@ -1041,6 +1205,13 @@ function syncQuickToggles() {
       await saveQuickSettings();
     });
   }
+
+  const translateToggle = $('#toggle-translate');
+  if (translateToggle) {
+    translateToggle.addEventListener('change', async () => {
+      await saveQuickSettings();
+    });
+  }
 }
 
 async function saveQuickSettings() {
@@ -1051,6 +1222,7 @@ async function saveQuickSettings() {
     c.hotwords_enabled = $('#toggle-hotwords')?.checked ?? true;
     c.llm_enabled = $('#toggle-llm')?.checked ?? false;
     c.realtime_enabled = $('#toggle-realtime')?.checked ?? false;
+    c.translate_enabled = $('#toggle-translate')?.checked ?? false;
     await invoke('save_config', { config: c });
   } catch (_) {}
 }
@@ -1124,7 +1296,6 @@ let realtimeFlushTimer = null;
 let realtimePcmBuffer = [];
 let realtimeMediaSource = null;
 let realtimeProcessor = null;
-let realtimeAudioCtx = null;
 
 function startRealtimeFlush() {
   // Use ScriptProcessorNode to capture raw PCM at 16kHz
@@ -1150,7 +1321,7 @@ function startRealtimeFlush() {
       <div class="entry-actions">
         <button class="entry-btn" data-copy>复制</button>
         <button class="entry-btn" data-paste>粘贴</button>
-        <button class="entry-btn translate-btn" data-translate>翻译</button>
+        <button class="entry-btn translate-btn" data-translate disabled>翻译</button>
       </div>
     </div>`;
   area?.prepend(el);
@@ -1167,6 +1338,34 @@ function startRealtimeFlush() {
     await invoke('copy_to_clipboard', { text });
     toast('✅ 已粘贴到当前窗口');
   });
+  el.querySelector('[data-translate]')?.addEventListener('click', async () => {
+    // Disabled during recording — only translate after recording ends
+    if (state.recording) {
+      toast('录音中无法翻译，请先停止录音', 'warning');
+      return;
+    }
+    const btn = el.querySelector('[data-translate]');
+    if (btn) btn.textContent = '翻译中...';
+    // Toggle existing translation
+    let existing = el.querySelector('.entry-translation');
+    if (existing) {
+      existing.remove();
+      if (btn) btn.textContent = '翻译';
+      return;
+    }
+    const text = el.querySelector('.entry-text')?.textContent || '';
+    const result = await translateText(text);
+    if (result) {
+      const meta = el.querySelector('.entry-meta');
+      const div = document.createElement('div');
+      div.className = 'entry-translation';
+      div.textContent = `🌐 ${result}`;
+      meta?.parentNode?.insertBefore(div, meta?.nextSibling || null);
+      if (btn) btn.textContent = '收起';
+    } else {
+      if (btn) btn.textContent = '翻译';
+    }
+  });
   el.querySelector('[data-del]')?.addEventListener('click', () => {
     const idx = state.transcriptions.findIndex(t => t.time === now);
     if (idx !== -1) state.transcriptions.splice(idx, 1);
@@ -1182,13 +1381,11 @@ function startRealtimeFlush() {
   const el2 = $('#char-count');
   if (el2) el2.textContent = total + ' 字';
 
-  // Create a dedicated 16kHz AudioContext for realtime capture
-  const rtAudioContext = new AudioContext({ sampleRate: 16000 });
-  const source = rtAudioContext.createMediaStreamSource(mediaStream);
+  // Use the shared audioContext (created at 16kHz in startRecording) for realtime PCM capture
+  const source = audioContext.createMediaStreamSource(mediaStream);
   // 4096 samples buffer, 1 input channel, 1 output channel
-  realtimeProcessor = rtAudioContext.createScriptProcessor(4096, 1, 1);
+  realtimeProcessor = audioContext.createScriptProcessor(4096, 1, 1);
   realtimePcmBuffer = [];
-  realtimeAudioCtx = rtAudioContext;
 
   realtimeProcessor.onaudioprocess = (e) => {
     if (!state.recording) return;
@@ -1200,20 +1397,20 @@ function startRealtimeFlush() {
 
   // Connect through processor to a silent GainNode (gain=0) as sink.
   // ScriptProcessorNode requires a downstream connection to fire onaudioprocess.
-  const silentSink = rtAudioContext.createGain();
+  const silentSink = audioContext.createGain();
   silentSink.gain.value = 0;
   source.connect(realtimeProcessor);
   realtimeProcessor.connect(silentSink);
-  silentSink.connect(rtAudioContext.destination);
+  silentSink.connect(audioContext.destination);
   realtimeMediaSource = source;
 
-  // Flush every 3 seconds using send_audio_chunk (non-destructive)
+  // Flush every 1.5 seconds using send_audio_chunk (non-destructive)
   realtimeFlushTimer = setInterval(async () => {
     if (realtimePcmBuffer.length === 0) return;
     const chunk = realtimePcmBuffer;
     realtimePcmBuffer = [];
     const duration = chunk.length / 16000;
-    if (duration < 0.5) {
+    if (duration < 0.3) {
       // Too short — put data back so it accumulates with future audio
       realtimePcmBuffer = chunk;
       return;
@@ -1223,7 +1420,7 @@ function startRealtimeFlush() {
     } catch (e) {
       console.warn('[Realtime] flush failed:', e);
     }
-  }, 3000);
+  }, 1500);
 
   micStatus.textContent = '● 实时转写中... 点击停止';
 }
@@ -1241,10 +1438,7 @@ function stopRealtimeFlush() {
     realtimeMediaSource.disconnect();
     realtimeMediaSource = null;
   }
-  if (realtimeAudioCtx) {
-    realtimeAudioCtx.close().catch(() => {});
-    realtimeAudioCtx = null;
-  }
+  // Shared audioContext is NOT closed here — it is managed by startRecording/onstop
   // Send any remaining buffered PCM
   if (realtimePcmBuffer.length > 0) {
     const remaining = realtimePcmBuffer;
@@ -1274,6 +1468,7 @@ async function loadSettings() {
     sc('toggle-paste', c.paste_on_finish);
     sc('toggle-hotwords', c.hotwords_enabled);
     sc('toggle-realtime', c.realtime_enabled || false);
+    sc('toggle-translate', c.translate_enabled || false);
     // Sync translate direction
     translateDir = c.translate_direction || 'auto';
     const translateBar = $('#translate-bar');
@@ -1346,8 +1541,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Setup LLM backend preset auto-fill
   setupLlmPresets();
 
+  // Setup history search
+  setupHistorySearch();
+
   // Setup hotword management
   setupHotwordManagement();
 
   await loadSettings();
+
+  // Fetch and display app version
+  try {
+    const ver = await getVersion();
+    const verEl = $('#about-version');
+    if (verEl) verEl.textContent = `版本 ${ver}`;
+    // Also update title bar
+    const titleEl = $('.titlebar-text');
+    if (titleEl) titleEl.textContent = `CapsWriter Desktop · v${ver}`;
+  } catch (_) {}
 });

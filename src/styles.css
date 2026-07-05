@@ -490,6 +490,17 @@ html, body {
 }
 .history-entry .entry-btn-del:hover { opacity: 1; background: #e74c3c22; color: #e74c3c; }
 
+/* Polished text badge */
+.polish-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 8px; border-radius: 10px;
+  font-size: 10px; font-weight: 500;
+  background: rgba(253, 203, 110, 0.12);
+  color: var(--warning);
+  margin-right: 6px;
+  animation: fade-in 0.3s ease;
+}
+
 /* Search results mode */
 .history-search-mode .history-date-title {
   color: var(--info);
@@ -692,6 +703,13 @@ mark {
 .trans-entry .entry-btn.translate-btn:hover {
   background: rgba(116, 185, 255, 0.1);
   border-color: var(--info);
+}
+.trans-entry .entry-btn.translate-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  border-color: var(--border);
+  color: var(--text-tertiary);
+  pointer-events: none;
 }
 .trans-entry .entry-btn-del {
   opacity: 0.35; padding: 2px 6px;

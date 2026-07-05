@@ -75,22 +75,23 @@ class ASRServer:
         # Try to start WebSocket server
         try:
             import websockets
-            self._server = await websockets.serve(
-                self._handle_client,
-                self.host,
-                self.port,
-                ping_interval=None,
-                max_size=10 * 1024 * 1024,  # 10MB max message
-            )
-            print(f"[Server] WebSocket listening on ws://{self.host}:{self.port}", flush=True)
-            print(f"[Server] Ready", flush=True)
-            await self._server.wait_closed()
         except ImportError:
-            # Fallback to stdin/stdout protocol
-            print(f"[Server] websockets not available, using stdio protocol", flush=True)
-            print(f"[Server] Mock listening on stdio", flush=True)
-            print(f"[Server] Ready", flush=True)
-            await self._handle_stdio()
+            print(f"[Server] FATAL: 'websockets' package is not installed.", flush=True)
+            print(f"[Server] Please install it: pip install websockets", flush=True)
+            print(f"[Server] Or: pip install -r sidecar/requirements.txt", flush=True)
+            print(f"[Server] Exiting.", flush=True)
+            return
+
+        self._server = await websockets.serve(
+            self._handle_client,
+            self.host,
+            self.port,
+            ping_interval=None,
+            max_size=10 * 1024 * 1024,  # 10MB max message
+        )
+        print(f"[Server] WebSocket listening on ws://{self.host}:{self.port}", flush=True)
+        print(f"[Server] Ready", flush=True)
+        await self._server.wait_closed()
 
     async def stop(self):
         """Stop the server."""

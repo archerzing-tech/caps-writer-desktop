@@ -1,14 +1,16 @@
 # CapsWriter ASR Sidecar Dependencies
-# Core ASR (choose one):
+# ====================================
+# Install with: pip install -r sidecar/requirements.txt
+
+# Core ASR engine (required for speech recognition):
 # sherpa-onnx>=1.10.0
-# numpy>=1.24.0
 
-# WebSocket server:
-# websockets>=12.0
+# WebSocket server (required - Tauri connects via WebSocket):
+websockets>=12.0
 
-# Optional: LLM integration
+# Numerical computing (required by server code):
+numpy>=1.24.0
+
+# Optional: LLM integration for translation/polishing
 # openai>=1.0.0
 # ollama>=0.1.0
-
-# For development/testing:
-numpy>=1.24.0
