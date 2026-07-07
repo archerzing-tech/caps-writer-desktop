@@ -255,6 +255,34 @@
                 <option value="dml">DirectML (GPU)</option>
               </select>
             </div>
+            <div class="setting-group" id="model-dir-group">
+              <label>模型目录（Qwen3-ASR 父目录）</label>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <input type="text" id="setting-model-dir" placeholder="例：/Users/me/work/skill/caps-writer-desktop/models" style="flex:1;min-width:280px;padding:6px 10px;border-radius:6px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.12);color:#e2e8f0;font-family:ui-monospace,Menlo,monospace;font-size:12px;" />
+                <button class="btn-secondary" id="btn-browse-model-dir">📁 选择…</button>
+              </div>
+              <div class="setting-hint" style="font-size:11px;color:#94a3b8;margin-top:4px;line-height:1.4;">
+                指向 sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 父目录（即同级含 conv_frontend.onnx 等文件）。<br>
+                留空时：先查 .app 同级目录 → ~/Library/Application Support/caps-writer-desktop/models → ~/Documents/.../models → CW_MODEL_DIR 环境变量。
+              </div>
+            </div>
+            <div class="setting-group" id="model-files-group">
+              <label>模型文件</label>
+              <div id="model-files-row" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                <span id="model-status-text" class="model-status-text">正在检测…</span>
+                <button class="btn-secondary" id="btn-download-model">⬇ 一键下载模型</button>
+              </div>
+              <div id="model-progress-wrap" style="display:none;margin-top:8px;">
+                <div style="height:8px;background:rgba(255,255,255,0.08);border-radius:6px;overflow:hidden;">
+                  <div id="model-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width 250ms ease;"></div>
+                </div>
+                <div id="model-progress-text" style="font-size:12px;margin-top:6px;color:#94a3b8;"></div>
+              </div>
+              <div id="model-error-text" style="display:none;margin-top:6px;color:#f87171;font-size:12px;"></div>
+              <div class="model-status-hint" style="font-size:11px;color:#94a3b8;margin-top:6px;">
+                下载位置：~/Library/Application Support/caps-writer-desktop/models/ (≈954 MB)
+              </div>
+            </div>
             <button class="btn-primary" id="btn-save-model">应用模型设置</button>
           </div>
 

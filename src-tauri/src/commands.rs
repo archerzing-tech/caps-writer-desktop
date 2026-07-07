@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub translate_direction: String,
     #[serde(default)]
     pub translate_enabled: bool,
+    #[serde(default)]
+    pub custom_models_dir: String,
 }
 
 impl Default for AppConfig {
@@ -39,6 +41,7 @@ impl Default for AppConfig {
             realtime_enabled: false,
             translate_direction: "auto".into(),
             translate_enabled: false,
+            custom_models_dir: String::new(),
         }
     }
 }
@@ -278,6 +281,16 @@ pub async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
         .add_filter("Audio", &["wav", "mp3", "m4a", "flac", "ogg", "aac"])
         .blocking_pick_file();
     Ok(file.map(|f| f.to_string()))
+}
+
+#[tauri::command]
+pub async fn pick_model_dir(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let folder = app
+        .dialog()
+        .file()
+        .blocking_pick_folder();
+    Ok(folder.map(|f| f.to_string()))
 }
 
 #[tauri::command]
@@ -865,4 +878,309 @@ fn chrono_datetime(unix_ts: f64) -> String {
         }
         Err(_) => format!("{}", unix_ts),
     }
+}
+
+// ============================================================
+// One-click Model Download from HuggingFace (sherpa-onnx-qwen3-asr)
+// ============================================================
+
+const MODEL_REPO: &str = "cattle12/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25";
+
+fn model_root_dir() -> std::path::PathBuf {
+    std::env::var("APPDATA")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+        .join("caps-writer-desktop")
+        .join("models")
+}
+
+fn model_target_dir() -> std::path::PathBuf {
+    model_root_dir().join(MODEL_REPO)
+}
+
+#[tauri::command]
+pub async fn download_qwen3_asr_model(app: AppHandle) -> Result<String, String> {
+    let target_dir = model_target_dir();
+    let sentinel = target_dir.join("DOWNLOAD_OK");
+
+    if sentinel.exists() {
+        let _ = app.emit(
+            "model-download-progress",
+            serde_json::json!({
+                "status": "already_installed",
+                "path": target_dir.to_string_lossy(),
+            }),
+        );
+        return Ok(format!("模型已就绪: {}", target_dir.to_string_lossy()));
+    }
+
+    // Spawn the actual download so the Invoke promise returns immediately.
+    // Progress is reported via Tauri events on `model-download-progress`.
+    let app_clone = app.clone();
+    let dir_for_task = target_dir.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = run_hf_download(app_clone.clone(), dir_for_task).await {
+            eprintln!("[model-download] error: {}", e);
+            let _ = app_clone.emit(
+                "model-download-progress",
+                serde_json::json!({
+                    "status": "error",
+                    "message": e,
+                }),
+            );
+        }
+    });
+    Ok("下载已启动，请观察下方进度条".into())
+}
+
+async fn run_hf_download(
+    app: AppHandle,
+    target_dir: std::path::PathBuf,
+) -> Result<String, String> {
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("创建模型目录失败: {}", e))?;
+
+    let _ = app.emit(
+        "model-download-progress",
+        serde_json::json!({
+            "status": "fetching_manifest",
+            "repo": MODEL_REPO,
+        }),
+    );
+    println!("[model-download] fetching HF tree manifest for {}", MODEL_REPO);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .user_agent("CapsWriter-Desktop/0.2")
+        .build()
+        .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+
+    let manifest_url = format!(
+        "https://huggingface.co/api/models/{}/tree/main",
+        MODEL_REPO
+    );
+    let resp = client
+        .get(&manifest_url)
+        .send()
+        .await
+        .map_err(|e| format!("获取HF清单失败: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HF清单返回 HTTP {}", resp.status()));
+    }
+    let page: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析HF清单失败: {}", e))?;
+
+    let files: Vec<(String, u64)> = page
+        .into_iter()
+        .filter(|item| {
+            item.get("type").and_then(|v| v.as_str()) == Some("file")
+        })
+        .filter_map(|item| {
+            let path = item.get("path").and_then(|v| v.as_str())?.to_string();
+            let size = item
+                .get("size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some((path, size))
+        })
+        .collect();
+
+    if files.is_empty() {
+        return Err("HF清单中没有可下载文件".into());
+    }
+
+    let total_bytes: u64 = files.iter().map(|(_, s)| *s).sum();
+    println!(
+        "[model-download] {} files, {:.1} MB total",
+        files.len(),
+        total_bytes as f64 / 1_000_000.0
+    );
+    let _ = app.emit(
+        "model-download-progress",
+        serde_json::json!({
+            "status": "downloading",
+            "files_total": files.len(),
+            "bytes_total": total_bytes,
+        }),
+    );
+
+    let mut received_total: u64 = 0;
+    for (i, (path, expected_size)) in files.iter().enumerate() {
+        let file_path = target_dir.join(path);
+        if let Some(parent) = file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Resumability: skip file if local size already matches expected size.
+        if file_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&file_path) {
+                if meta.len() == *expected_size && *expected_size > 0 {
+                    println!(
+                        "[model-download] skip existing {} ({} bytes)",
+                        path, expected_size
+                    );
+                    received_total += expected_size;
+                    let _ = app.emit(
+                        "model-download-progress",
+                        serde_json::json!({
+                            "status": "progress",
+                            "filename": path,
+                            "files_done": i,
+                            "files_total": files.len(),
+                            "bytes_received": received_total,
+                            "bytes_total": total_bytes,
+                            "skipped": true,
+                        }),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let file_url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            MODEL_REPO, path
+        );
+        println!(
+            "[model-download] GET {} -> {}",
+            file_url,
+            file_path.display()
+        );
+        let resp = client
+            .get(&file_url)
+            .send()
+            .await
+            .map_err(|e| format!("下载 {} 失败: {}", path, e))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {} 下载 {}", resp.status(), path));
+        }
+
+        let mut dest = std::fs::File::create(&file_path)
+            .map_err(|e| format!("创建 {} 失败: {}", file_path.display(), e))?;
+
+        // Buffer writes to ~256 KB chunks to balance I/O syscalls vs emit frequency.
+        let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+        let mut received: u64 = 0;
+        let mut last_emit = std::time::Instant::now();
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.map_err(|e| format!("读取 {} 失败: {}", path, e))?;
+            buf.extend_from_slice(&chunk);
+            if buf.len() >= 256 * 1024 {
+                std::io::Write::write_all(&mut dest, &buf)
+                    .map_err(|e| format!("写入 {} 失败: {}", file_path.display(), e))?;
+                received += buf.len() as u64;
+                buf.clear();
+            }
+            // Throttle emits to roughly every 250 ms to avoid event flood.
+            if last_emit.elapsed() >= std::time::Duration::from_millis(250) {
+                let _ = app.emit(
+                    "model-download-progress",
+                    serde_json::json!({
+                        "status": "progress",
+                        "filename": path,
+                        "files_done": i,
+                        "files_total": files.len(),
+                        "bytes_received": received_total + received + buf.len() as u64,
+                        "bytes_total": total_bytes,
+                    }),
+                );
+                last_emit = std::time::Instant::now();
+            }
+        }
+        if !buf.is_empty() {
+            std::io::Write::write_all(&mut dest, &buf)
+                .map_err(|e| format!("写入 {} 失败: {}", file_path.display(), e))?;
+            received += buf.len() as u64;
+        }
+        std::io::Write::flush(&mut dest)
+            .map_err(|e| format!("flush {} 失败: {}", file_path.display(), e))?;
+        drop(dest);
+        received_total += received;
+        println!(
+            "[model-download] done {} ({} bytes)",
+            path, received
+        );
+    }
+
+    // Sentinel file: confirms all downloads succeeded.
+    std::fs::write(
+        &sentinel_path(),
+        format!(
+            "ok @ {}\nrepo: {}\n",
+            chrono_datetime(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64()
+            ),
+            MODEL_REPO
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let _ = app.emit(
+        "model-download-progress",
+        serde_json::json!({
+            "status": "complete",
+            "path": target_dir.to_string_lossy(),
+            "bytes_received": received_total,
+            "bytes_total": total_bytes,
+        }),
+    );
+    println!(
+        "[model-download] COMPLETE — {} bytes to {}",
+        received_total,
+        target_dir.display()
+    );
+
+    Ok(format!(
+        "下载完成: {} ({:.1} MB)",
+        target_dir.display(),
+        received_total as f64 / 1_000_000.0
+    ))
+}
+
+fn sentinel_path() -> std::path::PathBuf {
+    model_target_dir().join("DOWNLOAD_OK")
+}
+
+#[tauri::command]
+pub fn check_model_status() -> Result<serde_json::Value, String> {
+    let target_dir = model_target_dir();
+    let ready = target_dir.join("DOWNLOAD_OK").exists();
+    let size_bytes: u64 = if target_dir.exists() {
+        walk_dir_size(&target_dir).unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(serde_json::json!({
+        "path": target_dir.to_string_lossy(),
+        "ready": ready,
+        "size_bytes": size_bytes,
+        "repo": MODEL_REPO,
+        "size_mb": (size_bytes as f64 / 1_000_000.0).round(),
+    }))
+}
+
+fn walk_dir_size(p: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    if p.is_file() {
+        return Ok(std::fs::metadata(p)?.len());
+    }
+    for entry in std::fs::read_dir(p)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_file() {
+            total += entry.metadata()?.len();
+        } else if ft.is_dir() {
+            total += walk_dir_size(&entry.path())?;
+        }
+    }
+    Ok(total)
 }

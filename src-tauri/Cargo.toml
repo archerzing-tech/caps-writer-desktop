@@ -1,6 +1,6 @@
 [package]
 name = "caps-writer-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "CapsWriter Desktop - Offline Speech to Text Desktop App"
 authors = ["you"]
 edition = "2021"
@@ -28,4 +28,4 @@ hound = "3.5"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 time = { version = "0.3", features = ["local-offset", "formatting"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }

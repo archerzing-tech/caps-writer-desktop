@@ -42,7 +42,9 @@ class SherpaOnnxEngine(ASREngine):
         try:
             import sherpa_onnx
         except ImportError:
-            print("[ASR] sherpa-onnx not installed. Using mock engine.")
+            import traceback
+            print(f"[ASR] sherpa-onnx import failed:\n{traceback.format_exc()}", flush=True)
+            print("[ASR] Install hint: pip install --break-system-packages sherpa_onnx  (macOS Sonoma+ blocks PEP 668 user installs)", flush=True)
             return False
 
         try:
@@ -57,14 +59,18 @@ class SherpaOnnxEngine(ASREngine):
             else:
                 raise ValueError(f"Unknown model type: {self.model_type}")
 
+            if self._recognizer is None:
+                print(f"[ASR] Engine {self.model_type} returned None (paths may be missing — see error above).", flush=True)
             return self._recognizer is not None
         except Exception as e:
-            print(f"[ASR] Failed to load model {self.model_type}: {e}")
+            import traceback
+            print(f"[ASR] Exception while loading {self.model_type}:\n{traceback.format_exc()}", flush=True)
             return False
 
     def _create_qwen_asr(self):
         """Create OfflineRecognizer from_qwen3_asr."""
         import sherpa_onnx
+        import os
         paths = self._model_paths
 
         conv_frontend = paths.get('conv_frontend', '')
@@ -72,8 +78,15 @@ class SherpaOnnxEngine(ASREngine):
         decoder = paths.get('decoder', '')
         tokenizer = paths.get('tokenizer', '') or paths.get('tokens', '')
 
-        if not conv_frontend or not encoder or not decoder or not tokenizer:
-            print(f"[ASR] Qwen3-ASR missing model files: conv_frontend={conv_frontend}, encoder={encoder}, decoder={decoder}, tokenizer={tokenizer}")
+        # Fail-fast on disk existence so the error names the missing file.
+        missing = [p for p in (conv_frontend, encoder, decoder, tokenizer)
+                   if not (p and os.path.exists(p))]
+        if missing:
+            print(f"[ASR] Qwen3-ASR missing model files on disk.", flush=True)
+            print(f"[ASR]   conv_frontend: {conv_frontend!r}  exists={bool(conv_frontend) and os.path.exists(conv_frontend)}", flush=True)
+            print(f"[ASR]   encoder:       {encoder!r}  exists={bool(encoder) and os.path.exists(encoder)}", flush=True)
+            print(f"[ASR]   decoder:       {decoder!r}  exists={bool(decoder) and os.path.exists(decoder)}", flush=True)
+            print(f"[ASR]   tokenizer:     {tokenizer!r}  exists={bool(tokenizer) and os.path.exists(tokenizer)}", flush=True)
             return None
 
         return sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
@@ -207,6 +220,39 @@ class SherpaOnnxEngine(ASREngine):
         }
 
 
+class QwenAsrGgufWrapper(ASREngine):
+    """ASR engine using ONNX encoder + GGUF LLM decoder (hybrid)."""
+
+    def __init__(self, model_type: str = 'qwen_asr_gguf', config: dict = None):
+        super().__init__(model_type, config)
+        self._engine = None
+
+    def load(self) -> bool:
+        try:
+            from .qwen_asr_gguf import QwenAsrGgufEngine
+            model_dir = self.config.get('model_dir', '')
+            provider = self.config.get('provider', 'cpu').upper()
+            if not model_dir:
+                print("[ASR] GGUF engine: no model_dir specified", flush=True)
+                return False
+            self._engine = QwenAsrGgufEngine(model_dir, onnx_provider=provider)
+            return True
+        except Exception as e:
+            import traceback
+            print(f"[ASR] GGUF engine load failed:\n{traceback.format_exc()}", flush=True)
+            return False
+
+    def recognize(self, audio: np.ndarray, is_final: bool = True) -> dict:
+        if self._engine is None:
+            return {'text': '', 'tokens': [], 'timestamps': []}
+        return self._engine.recognize(audio, is_final=is_final)
+
+    def unload(self):
+        if self._engine and hasattr(self._engine, 'cleanup'):
+            self._engine.cleanup()
+        self._engine = None
+
+
 class MockEngine(ASREngine):
     """Mock engine for development/demo without actual model files."""
 
@@ -234,9 +280,22 @@ class MockEngine(ASREngine):
 
 def create_engine(model_type: str = 'sensevoice', config: dict = None) -> ASREngine:
     """Factory: create the appropriate ASR engine."""
+    import os
+    config = config or {}
+
+    # Auto-detect GGUF model: if model_dir contains .gguf files, use hybrid engine
+    if model_type in ('qwen_asr', 'qwen3-asr'):
+        model_dir = config.get('model_dir', '')
+        if model_dir and any(f.endswith('.gguf') for f in os.listdir(model_dir) if os.path.isfile(os.path.join(model_dir, f))):
+            print(f"[ASR] Detected GGUF model in {model_dir}, using hybrid engine", flush=True)
+            return QwenAsrGgufWrapper('qwen_asr_gguf', config)
+
     try:
         import sherpa_onnx
         return SherpaOnnxEngine(model_type, config)
     except ImportError:
-        print("[ASR] sherpa-onnx not available, using MockEngine")
+        import traceback
+        print("[ASR] FATAL: sherpa-onnx is not importable in this python — falling back to MockEngine (demo text only).", flush=True)
+        print("[ASR] Fix: pip install --break-system-packages sherpa_onnx  (macOS Sonoma+ blocks PEP 668 user installs)", flush=True)
+        print(traceback.format_exc(), flush=True)
         return MockEngine(model_type, config)

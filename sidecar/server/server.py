@@ -33,26 +33,80 @@ class ASRServer:
         self._server = None
         self._tasks = {}
 
+    @staticmethod
+    def _resolve_tokenizer_dir(model_subdir: Path) -> str:
+        """Resolve the tokenizer DIRECTORY path for sherpa_onnx.
+
+        sherpa_onnx.OfflineRecognizer.from_qwen3_asr(tokenizer=...) expects
+        a DIRECTORY containing vocab.json (the tokenizer/ folder),
+        NOT a single tokens.txt file.
+        """
+        tokenizer_dir = model_subdir / 'tokenizer'
+        if tokenizer_dir.is_dir() and (tokenizer_dir / 'vocab.json').exists():
+            return str(tokenizer_dir)
+        # Fallback: if vocab.json is at the model root
+        if (model_subdir / 'vocab.json').exists():
+            return str(model_subdir)
+        # Last resort: return expected path so error message is clear
+        return str(tokenizer_dir)
+
     def _load_config(self):
         """Load configuration from config file or environment."""
         import os
         self.model_type = os.environ.get('CW_MODEL_TYPE', 'qwen_asr')
         model_dir = os.environ.get('CW_MODEL_DIR', '')
 
+        # Auto-detect: when CW_MODEL_DIR is empty (typical for bundled .app),
+        # search the script directory's grandparent (project root or _up_/)
+        # plus a couple of macOS user-data locations.
+        if not model_dir:
+            base_script_dir = Path(__file__).resolve().parent.parent
+            candidates = [
+                base_script_dir / 'models',
+                Path.home() / 'Library' / 'Application Support' / 'caps-writer-desktop' / 'models',
+                Path.home() / 'Documents' / 'caps-writer-desktop' / 'models',
+            ]
+            for c in candidates:
+                try:
+                    if c.exists() and any(c.iterdir()):
+                        model_dir = str(c)
+                        print(f"[Server] Auto-detected model directory: {model_dir}", flush=True)
+                        break
+                except OSError:
+                    continue
+
         config = {}
         if model_dir:
             base = Path(model_dir)
-            config = {
-                'qwen_asr': {
-                    'conv_frontend': str(base / 'sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25' / 'conv_frontend.onnx'),
-                    'encoder': str(base / 'sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25' / 'encoder.int8.onnx'),
-                    'decoder': str(base / 'sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25' / 'decoder.int8.onnx'),
-                    'tokenizer': str(base / 'sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25' / 'tokenizer'),
-                    'num_threads': 4,
-                    'max_total_len': 1024,
-                    'max_new_tokens': 512,
-                },
-            }.get(self.model_type, {})
+
+            # Detect GGUF model (e.g. Qwen3-ASR-1.7B with .gguf file)
+            # Search for .gguf files in subdirectories
+            gguf_subdir = None
+            for subdir in sorted(base.iterdir()):
+                if subdir.is_dir() and any(f.suffix == '.gguf' for f in subdir.iterdir() if f.is_file()):
+                    gguf_subdir = subdir
+                    break
+
+            if gguf_subdir and self.model_type in ('qwen_asr', 'qwen3-asr'):
+                print(f"[Server] Detected GGUF model: {gguf_subdir}", flush=True)
+                config = {
+                    'model_dir': str(gguf_subdir),
+                }
+            else:
+                # sherpa-onnx ONNX model (0.6B int8)
+                model_subdir = base / 'sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25'
+                tokenizer_path = self._resolve_tokenizer_dir(model_subdir)
+                config = {
+                    'qwen_asr': {
+                        'conv_frontend': str(model_subdir / 'conv_frontend.onnx'),
+                        'encoder': str(model_subdir / 'encoder.int8.onnx'),
+                        'decoder': str(model_subdir / 'decoder.int8.onnx'),
+                        'tokenizer': tokenizer_path,
+                        'num_threads': 4,
+                        'max_total_len': 1024,
+                        'max_new_tokens': 512,
+                    },
+                }.get(self.model_type, {})
 
         config['language'] = os.environ.get('CW_LANGUAGE', 'auto')
         config['provider'] = os.environ.get('CW_PROVIDER', 'cpu')
@@ -69,8 +123,11 @@ class ASRServer:
         
         if loaded:
             print(f"[Server] ASR engine loaded: {self.model_type}", flush=True)
+        elif 'Mock' in str(type(self.engine)):
+            print(f"[Server] WARNING: Using mock engine (sherpa-onnx not available). Real recognition will return canned demo text only.", flush=True)
+            print(f"[Server] To enable real ASR: pip install --break-system-packages sherpa_onnx  (Python 3.13.12 here)", flush=True)
         else:
-            print(f"[Server] Using mock engine (sherpa-onnx not available)", flush=True)
+            print(f"[Server] ERROR: Real engine {self.model_type} load FAILED (see [ASR] line above for traceback). Real recognition will NOT work.", flush=True)
 
         # Try to start WebSocket server
         try:
@@ -208,7 +265,7 @@ class ASRServer:
             self.model_type = new_model
             if self.engine:
                 self.engine.unload()
-            self.engine = create_engine(self.model_type, {})
+            self.engine = create_engine(self.model_type, self._load_config())
             self.engine.load()
             print(f"[Server] Switched to model: {self.model_type}", flush=True)
 

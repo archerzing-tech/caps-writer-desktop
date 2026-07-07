@@ -25,6 +25,39 @@ let analyserNode = null;
 let animationId = null;
 let mediaStream = null;
 
+// --- Standard mode raw-PCM fallback (used when MediaRecorder isn't supported) ---
+let standardPcmBuffer = [];      // float32 PCM samples accumulated during recording
+let standardPcmHandles = null;   // { source, proc, sink } for cleanup
+let onStoppedHandler = null;     // assigned in startRecording(), invoked from stopRecording() when mediaRecorder is null
+
+// === Helpers: Raw PCM capture (lossless 16kHz Float32) ===
+
+function startStandardPcmCapture(audioCtx, stream, buffer) {
+  // Raw-PCM capture path used as last-resort fallback when MediaRecorder
+  // construction throws. Mirrors realtime path but writes into shared `buffer`.
+  buffer.length = 0;
+  const source = audioCtx.createMediaStreamSource(stream);
+  const proc = audioCtx.createScriptProcessor(4096, 1, 1);
+  const sink = audioCtx.createGain();
+  sink.gain.value = 0;
+  proc.onaudioprocess = (e) => {
+    if (!state.recording) return;
+    const input = e.inputBuffer.getChannelData(0);
+    for (let i = 0; i < input.length; i++) buffer.push(input[i]);
+  };
+  source.connect(proc);
+  proc.connect(sink);
+  sink.connect(audioCtx.destination);
+  return { source, proc, sink };
+}
+
+function stopStandardPcmCapture(handles) {
+  if (!handles) return;
+  try { handles.source.disconnect(); } catch (_) {}
+  try { handles.proc.disconnect(); } catch (_) {}
+  try { handles.sink.disconnect(); } catch (_) {}
+}
+
 // --- DOM ---
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
@@ -63,23 +96,21 @@ async function startRecording() {
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        sampleRate: 16000,
-        channelCount: 1,
+        sampleRate: { ideal: 16000 },
+        channelCount: { ideal: 1 },
         echoCancellation: true,
         noiseSuppression: true,
       },
     });
 
     audioChunks = [];
-    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus' : 'audio/webm';
-    mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime });
 
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) audioChunks.push(e.data);
-    };
+    // Bypass MediaRecorder — always use raw PCM 16kHz lossless capture.
+    // MediaRecorder encodes as webm/opus which loses acoustic detail and
+    // degrades ASR recognition accuracy significantly.
+    mediaRecorder = null;
 
-    mediaRecorder.onstop = async () => {
+    const onStopped = async () => {
       if (mediaStream) {
         mediaStream.getTracks().forEach((t) => t.stop());
         mediaStream = null;
@@ -167,10 +198,10 @@ async function startRecording() {
         state.realtimeActive = false;
         realtimeCardEl = null; // Done building this card
         try { await invoke('stop_recording', { audioData: [] }); } catch (_) {}
-      } else {
-        // Standard mode: decode all audio and send at once
+      } else if (mediaRecorder) {
+        // Standard mode MediaRecorder path: decode all encoded audio and send at once
         try {
-          const blob = new Blob(audioChunks, { type: mime });
+          const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
           const buf = await blob.arrayBuffer();
           const actx = new AudioContext({ sampleRate: 16000 });
           const decoded = await actx.decodeAudioData(buf);
@@ -204,6 +235,37 @@ async function startRecording() {
             }
           }
         }, 2000);
+      } else {
+        // Standard mode raw-PCM fallback path (MediaRecorder unavailable).
+        // Just send the float32 sample buffer we collected via ScriptProcessorNode.
+        try {
+          const arr = standardPcmBuffer.length > 0 ? Array.from(standardPcmBuffer) : [];
+          await invoke('stop_recording', { audioData: arr });
+        } catch (e) {
+          console.error('[Standard PCM] invoke failed:', e);
+          const fallbackText = state.transcriptions[0]?.text?.trim();
+          if (fallbackText) {
+            const now = Date.now() / 1000;
+            autoSaveHistory(fallbackText, now, 0);
+            state.historySavedForSession = true;
+            toast('⚠ ASR 处理失败，已保存当前文本', 'warning');
+          }
+          await invoke('stop_recording', { audioData: [] });
+        }
+        // Same delayed-save safety net as the MediaRecorder path
+        setTimeout(() => {
+          if (!state.historySavedForSession) {
+            const pendingText = state.transcriptions[0]?.text?.trim();
+            if (pendingText) {
+              const now = Date.now() / 1000;
+              autoSaveHistory(pendingText, now, 0);
+              state.historySavedForSession = true;
+            }
+          }
+        }, 2000);
+        stopStandardPcmCapture(standardPcmHandles);
+        standardPcmHandles = null;
+        standardPcmBuffer = [];
       }
 
       // Signal that main processing in onstop is done.
@@ -219,6 +281,10 @@ async function startRecording() {
 
       micStatus.textContent = '就绪 · 点击录音';
     };
+    if (mediaRecorder) {
+      mediaRecorder.onstop = onStopped;
+    }
+    onStoppedHandler = onStopped;
 
     // Analyser for waveform (use 16kHz to match mic constraints; also reused by realtime)
     audioContext = new AudioContext({ sampleRate: 16000 });
@@ -228,7 +294,13 @@ async function startRecording() {
     src.connect(analyserNode);
 
     await invoke('start_recording');
-    mediaRecorder.start(100);
+    if (mediaRecorder) {
+      mediaRecorder.start(100);
+    } else {
+      // Wire up raw-PCM capture using the shared audioContext (already created
+      // for the waveform analyser). onaudioprocess will fill standardPcmBuffer.
+      standardPcmHandles = startStandardPcmCapture(audioContext, mediaStream, standardPcmBuffer);
+    }
     state.recording = true;
     micBtn?.classList.add('recording');
     document.body.classList.add('recording-active');
@@ -243,8 +315,10 @@ async function startRecording() {
     // Reset processing flag for new recording
     state.processingEnded = false;
   } catch (e) {
-    micStatus.textContent = '麦克风访问失败';
-    console.error(e);
+    const name = e && e.name ? e.name : '未知错误';
+    const msg  = e && e.message ? `: ${e.message}` : '';
+    micStatus.textContent = `麦克风访问失败 (${name})${msg}`;
+    console.error('[getUserMedia]', e);
     if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
     mediaStream = null;
     if (audioContext) {
@@ -261,6 +335,15 @@ function stopRecording() {
 
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     mediaRecorder.stop();
+  } else if (!mediaRecorder && state.recording && typeof onStoppedHandler === 'function') {
+    // No MediaRecorder (PCM fallback path). Fire the same handler so cleanup,
+    // WS send, and history-save all run. setTimeout defers one tick so
+    // state.recording=false (set below) stops the onaudioprocess first.
+    // Snapshot + null out, so a quick subsequent startRecording() can't redirect
+    // this snapshot to the new session's state.
+    const h = onStoppedHandler;
+    onStoppedHandler = null;
+    setTimeout(h, 0);
   }
   state.recording = false;
   micBtn?.classList.remove('recording');
@@ -516,6 +599,105 @@ listen('server-status', (e) => {
 
 listen('server-log', (e) => console.log('[ASR]', e.payload));
 
+listen('model-download-progress', (e) => {
+  const d = e.payload || {};
+  const wrap = $('#model-progress-wrap');
+  const bar = $('#model-progress-bar');
+  const txt = $('#model-progress-text');
+  const errBox = $('#model-error-text');
+  const statusText = $('#model-status-text');
+  const dlBtn = $('#btn-download-model');
+  if (errBox) errBox.style.display = 'none';
+
+  if (d.status === 'fetching_manifest') {
+    if (wrap) wrap.style.display = 'block';
+    if (bar) bar.style.width = '2%';
+    if (txt) txt.textContent = '正在从 HuggingFace 获取文件清单...';
+    if (statusText) statusText.textContent = '准备下载...';
+  } else if (d.status === 'downloading') {
+    if (wrap) wrap.style.display = 'block';
+    const totalMB = ((d.bytes_total || 0) / 1_000_000).toFixed(1);
+    if (txt) txt.textContent = `共 ${d.files_total} 个文件, ${totalMB} MB`;
+    if (dlBtn) { dlBtn.disabled = true; dlBtn.textContent = '⏳ 下载中...'; }
+  } else if (d.status === 'progress') {
+    if (wrap) wrap.style.display = 'block';
+    const bytes_total = d.bytes_total || 0;
+    const pct = bytes_total > 0 ? Math.min(100, ((d.bytes_received || 0) / bytes_total) * 100) : 0;
+    if (bar) bar.style.width = pct.toFixed(2) + '%';
+    const recvMB = ((d.bytes_received || 0) / 1_000_000).toFixed(1);
+    const totalMB = (bytes_total / 1_000_000).toFixed(1);
+    const fileLabel = d.skipped ? `⏭ ${d.filename}` : d.filename;
+    if (txt) txt.textContent = `[${(d.files_done || 0) + 1}/${d.files_total}] ${fileLabel} — ${recvMB}/${totalMB} MB (${pct.toFixed(1)}%)`;
+    if (statusText) statusText.textContent = `下载中 ${recvMB}/${totalMB} MB (${pct.toFixed(0)}%)`;
+  } else if (d.status === 'complete') {
+    if (wrap) wrap.style.display = 'none';
+    if (statusText) statusText.textContent = `✅ 模型已就绪 (${((d.bytes_received || 0) / 1_000_000).toFixed(1)} MB)`;
+    if (dlBtn) { dlBtn.disabled = false; dlBtn.style.display = 'none'; }
+    refreshModelStatus();
+  } else if (d.status === 'already_installed') {
+    if (statusText) statusText.textContent = '✅ 模型已就绪';
+    if (dlBtn) dlBtn.style.display = 'none';
+  } else if (d.status === 'error') {
+    if (wrap) wrap.style.display = 'none';
+    if (errBox) { errBox.style.display = 'block'; errBox.textContent = `❌ ${d.message || '下载失败'}`; }
+    if (statusText) statusText.textContent = '下载失败';
+    if (dlBtn) { dlBtn.disabled = false; dlBtn.textContent = '⬇ 一键下载模型'; }
+  }
+});
+
+async function refreshModelStatus() {
+  const t = $('#model-status-text');
+  const dl = $('#btn-download-model');
+  if (!t || !dl) return;
+  try {
+    const s = await invoke('check_model_status');
+    if (s.ready) {
+      t.textContent = `✅ 模型已就绪 (${s.size_mb} MB)`;
+      dl.style.display = 'none';
+    } else if (s.size_bytes > 0) {
+      t.textContent = `⚠ 模型文件不完整 (${s.size_mb} MB)，建议重新下载`;
+      dl.style.display = '';
+      dl.textContent = '⬇ 一键下载模型';
+      dl.disabled = false;
+    } else {
+      t.textContent = '⏬ 模型未下载（将使用 Mock 引擎）';
+      dl.style.display = '';
+      dl.textContent = '⬇ 一键下载模型 (≈954 MB)';
+      dl.disabled = false;
+    }
+  } catch (e) {
+    t.textContent = `❌ 检测失败: ${e}`;
+  }
+}
+
+$('#btn-download-model')?.addEventListener('click', async () => {
+  const dl = $('#btn-download-model');
+  const wrap = $('#model-progress-wrap');
+  const txt = $('#model-progress-text');
+  const bar = $('#model-progress-bar');
+  if (dl) { dl.disabled = true; dl.textContent = '⏳ 启动中...'; }
+  if (wrap) wrap.style.display = 'block';
+  if (bar) bar.style.width = '0%';
+  if (txt) txt.textContent = '准备下载...';
+  try {
+    const r = await invoke('download_qwen3_asr_model');
+    console.log('[download-model]', r);
+  } catch (e) {
+    const errBox = $('#model-error-text');
+    const t = $('#model-status-text');
+    if (errBox) { errBox.style.display = 'block'; errBox.textContent = `❌ ${e}`; }
+    if (t) t.textContent = '下载失败';
+    if (dl) { dl.disabled = false; dl.textContent = '⬇ 一键下载模型'; }
+    if (wrap) wrap.style.display = 'none';
+  }
+});
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', refreshModelStatus);
+} else {
+  refreshModelStatus();
+}
+
 function updateServerBadge() {
   const b = $('#server-badge');
   const retry = $('#server-retry');
@@ -583,9 +765,10 @@ $('#btn-save-model')?.addEventListener('click', async () => {
     trash_punc: $('#setting-trash-punc')?.value || '，,。。',
     gpu: $('#setting-gpu')?.value || 'cpu',
     realtime_enabled: $('#setting-realtime')?.checked ?? false,
+    custom_models_dir: $('#setting-model-dir')?.value?.trim() || '',
     translate_direction: translateDir || 'auto',
   };
-  try { await invoke('save_config', { config: c }); toast('✅ 设置已保存'); }
+  try { await invoke('save_config', { config: c }); toast('✅ 已保存，重启应用后生效（Cmd+Q + 重新打开）', 'info', 5000); }
   catch (e) { toast(`保存失败: ${e}`, 'error'); }
 });
 $('#setting-threshold')?.addEventListener('input', (e) => {
@@ -1145,7 +1328,7 @@ function setupClearHistory() {
 }
 
 // === Toast ===
-function toast(msg, type = 'info') {
+function toast(msg, type = 'info', duration = 3000) {
   const c = $('#toast-container');
   if (!c) return;
   const t = document.createElement('div');
@@ -1158,7 +1341,7 @@ function toast(msg, type = 'info') {
     t.classList.remove('show');
     t.classList.add('hide');
     setTimeout(() => t.remove(), 300);
-  }, 3000);
+  }, duration);
 }
 
 function getToastIcon(type) {
@@ -1464,6 +1647,7 @@ async function loadSettings() {
     sc('setting-save-audio', c.save_audio); sv('setting-trash-punc', c.trash_punc);
     sv('setting-gpu', c.gpu || 'cpu');
     sc('setting-realtime', c.realtime_enabled || false);
+    sv('setting-model-dir', c.custom_models_dir || '');
     // Sync quick bar toggles
     sc('toggle-paste', c.paste_on_finish);
     sc('toggle-hotwords', c.hotwords_enabled);
@@ -1558,4 +1742,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     const titleEl = $('.titlebar-text');
     if (titleEl) titleEl.textContent = `CapsWriter Desktop · v${ver}`;
   } catch (_) {}
+});
+
+$('#btn-browse-model-dir')?.addEventListener('click', async () => {
+  const input = $('#setting-model-dir');
+  if (!input) return;
+  try {
+    const picked = await invoke('pick_model_dir');
+    if (picked) {
+      input.value = picked;
+      console.log('[model-dir] picked', picked);
+    }
+  } catch (e) {
+    console.error('[model-dir] pick failed', e);
+    alert(`选择目录失败: ${e}`);
+  }
 });

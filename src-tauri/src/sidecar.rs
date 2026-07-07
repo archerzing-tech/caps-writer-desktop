@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::Mutex;
 use tokio::net::TcpStream;
@@ -26,9 +26,14 @@ impl SidecarManager {
     }
 
     fn get_script_path(&self) -> Result<PathBuf, String> {
-        let cwd = std::env::current_dir().unwrap_or_default();
         let mut candidates: Vec<PathBuf> = Vec::new();
 
+        if let Ok(res_dir) = self.app.path().resource_dir() {
+            candidates.push(res_dir.join("_up_").join("sidecar").join("caps-writer-server.py"));
+            candidates.push(res_dir.join("sidecar").join("caps-writer-server.py"));
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_default();
         candidates.push(cwd.join("sidecar").join("caps-writer-server.py"));
         if let Some(parent) = cwd.parent() {
             candidates.push(parent.join("sidecar").join("caps-writer-server.py"));
@@ -63,18 +68,62 @@ impl SidecarManager {
         }
         println!("[sidecar] script exists, checking python...");
 
-        // Quick check: can we find python?
-        match std::process::Command::new("python").arg("--version").output() {
-            Ok(out) => println!("[sidecar] python check: {}", String::from_utf8_lossy(&out.stdout).trim()),
-            Err(e) => println!("[sidecar] python check FAILED: {}", e),
+        // Quick check: can we find python? Prefer `python`, fall back to `python3`
+        // (macOS Sonoma+ drops the unversioned `python` symlink).
+        let mut python_bin = "python";
+        if std::process::Command::new(python_bin).arg("--version").output().is_err() {
+            python_bin = "python3";
+        }
+        match std::process::Command::new(python_bin).arg("--version").output() {
+            Ok(out) => println!("[sidecar] {} check: {}", python_bin, String::from_utf8_lossy(&out.stdout).trim()),
+            Err(e) => println!("[sidecar] {} check FAILED: {}", python_bin, e),
         }
 
-        // Resolve models directory relative to the script path
-        let models_dir = script_path
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("models"))
-            .filter(|p| p.exists())
+        // Read user-configured custom_models_dir from config.json (highest priority).
+        // This is the primary fix for the bundled .app not finding the user-installed
+        // model directory (which lives outside /Applications, e.g. in a dev tree).
+        // On macOS the Tauri UI saves config to ~/Library/Application Support/…
+        // but APPDATA (Windows) or bare HOME could also be valid.
+        let config_path = if cfg!(target_os = "macos") {
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+                .join("Library")
+                .join("Application Support")
+                .join("caps-writer-desktop")
+                .join("config.json")
+        } else {
+            std::env::var("APPDATA")
+                .or_else(|_| std::env::var("HOME"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+                .join("caps-writer-desktop")
+                .join("config.json")
+        };
+        println!("[sidecar] reading config from: {}", config_path.display());
+        let user_models_dir: Option<std::path::PathBuf> = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("custom_models_dir").and_then(|x| x.as_str()).map(String::from))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists() && p.is_dir());
+
+        if let Some(ref u) = user_models_dir {
+            println!("[sidecar] using custom_models_dir from config: {}", u.display());
+        }
+
+        // Resolve models directory relative to the script path: HIGHEST priority
+        // is the user-specified custom dir; otherwise fall through to the auto-detect chain.
+        let models_dir = user_models_dir
+            .or_else(|| {
+                script_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("models"))
+                    .filter(|p| p.exists())
+            })
             .or_else(|| {
                 // Fallback: check alongside executable
                 std::env::current_exe().ok().and_then(|exe| {
@@ -89,23 +138,53 @@ impl SidecarManager {
                     .ok()
                     .map(|p| p.join("models"))
                     .filter(|p| p.exists())
+            })
+            .or_else(|| {
+                // Fallback: ~/Library/Application Support/caps-writer-desktop/models (macOS user data)
+                std::env::var("HOME").ok().map(|h| {
+                    PathBuf::from(h).join("Library").join("Application Support")
+                        .join("caps-writer-desktop").join("models")
+                }).filter(|p| p.exists())
+            })
+            .or_else(|| {
+                // Fallback: ~/Documents/caps-writer-desktop/models
+                std::env::var("HOME").ok().map(|h| {
+                    PathBuf::from(h).join("Documents").join("caps-writer-desktop")
+                        .join("models")
+                }).filter(|p| p.exists())
+            })
+            .or_else(|| {
+                // Fallback: respect CW_MODEL_DIR env var (overrides all)
+                std::env::var("CW_MODEL_DIR").ok().map(PathBuf::from).filter(|p| p.exists())
             });
+
+        // Loud remediation banner when we couldn't find any models dir AND the
+        // user hasn't set CW_MODEL_DIR externally.
+        if models_dir.is_none() && std::env::var("CW_MODEL_DIR").is_err() {
+            println!("[sidecar] ===================================================================");
+            println!("[sidecar] ERROR: No 'models' dir found near executable, and CW_MODEL_DIR is unset.");
+            println!("[sidecar] To enable real Qwen3-ASR, do ONE of:");
+            println!("[sidecar]   1. export CW_MODEL_DIR=/path/to/dir/containing/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+            println!("[sidecar]   2. Place the model folder under <project>/models/  (auto-detected by Python)");
+            println!("[sidecar]   3. Place the model folder under ~/Library/Application Support/caps-writer-desktop/models/  (auto-detected)");
+            println!("[sidecar] Without these, the sidecar will fall back to mock-recognition (demo text).");
+            println!("[sidecar] ===================================================================");
+        }
 
         // Kill any stale process occupying port 6016
         self.kill_stale_on_port(6016).await;
 
-        let mut cmd = self.app.shell().command("python").arg(&script_str);
+        let mut cmd = self.app.shell().command(python_bin).arg(&script_str);
         if let Some(md) = &models_dir {
             cmd = cmd.env("CW_MODEL_DIR", md.to_string_lossy().to_string());
         }
+        // Force Python unbuffered stdout/stderr so [Server]/[ASR]/[Mock] log lines
+        // stream to the Rust sidecar immediately (otherwise they get trapped in the
+        // CPython block buffer when stdout/stderr are not connected to a TTY).
+        cmd = cmd.env("PYTHONUNBUFFERED", "1");
 
-        // Pass GPU provider (cpu/dml) to the sidecar
-        let config_dir = std::env::var("APPDATA")
-            .or_else(|_| std::env::var("HOME"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
-            .join("caps-writer-desktop");
-        let config_file = config_dir.join("config.json");
+        // Pass GPU provider (cpu/dml) to the sidecar — reuse the same config path
+        let config_file = config_path.clone();
         if let Ok(config_content) = std::fs::read_to_string(&config_file) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&config_content) {
                 if let Some(gpu) = parsed.get("gpu").and_then(|v| v.as_str()) {

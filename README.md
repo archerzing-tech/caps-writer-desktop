@@ -4,7 +4,7 @@
 
 **完全离线的语音输入桌面应用**
 
-基于 [Tauri](https://tauri.app) + [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 构建，支持中文 / 英文 / 日文实时语音识别，无需联网，数据安全无忧。
+基于 [Tauri](https://tauri.app) + **Qwen3-ASR 1.7B GGUF 混合引擎**（ONNX 编码器 + llama.cpp LLM 解码器）构建，支持中文 / 英文实时语音识别，无需联网，数据安全无忧。
 
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-blue?logo=tauri)](https://tauri.app)
 [![Rust](https://img.shields.io/badge/Rust-1.70+-orange?logo=rust)](https://rust-lang.org)
@@ -20,7 +20,7 @@
 | 功能 | 说明 |
 |------|------|
 | 🎙 **实时语音输入** | 点击麦克风即可语音输入，识别结果实时显示，支持一键复制/粘贴到当前窗口 |
-| 🌐 **完全离线运行** | 基于 sherpa-onnx 本地推理，无需网络，隐私安全 |
+| 🌐 **完全离线运行** | 基于 Qwen3-ASR GGUF 混合引擎 本地推理，无需网络，隐私安全 |
 | 📁 **文件转录** | 拖拽或选择音频文件（WAV/MP3/M4A/FLAC/OGG/AAC）进行转录，支持导出 SRT/TXT/JSON |
 | 📋 **历史记录** | 按日期归档所有转录记录，支持全文搜索、单条删除、一键清空 |
 | 🔄 **实时翻译** | 支持中英互译（英→中 / 中→英），基于 LLM API |
@@ -91,8 +91,8 @@
 │   ┌─────────────────▼─────────────────────────┐     │
 │   │        Python ASR Server (sidecar)         │     │
 │   │  ┌─────────────────────────────────────┐   │     │
-│   │  │  sherpa-onnx · Qwen3-ASR 0.6B      │   │     │
-│   │  │  (int8 量化，CPU/DML 推理)          │   │     │
+│   │  │  Qwen3-ASR 1.7B GGUF 混合引擎    │   │     │
+│   │  │  (ONNX 编码器 + llama.cpp LLM)     │   │     │
 │   │  └─────────────────────────────────────┘   │     │
 │   └───────────────────────────────────────────┘     │
 │                                                     │
@@ -109,7 +109,8 @@
 |------|------|------|
 | **桌面框架** | Tauri 2 | 窗口管理、系统托盘、原生对话框、剪贴板 |
 | **后端语言** | Rust | 音频采集 (cpal)、WebSocket 通信、配置管理 |
-| **ASR 引擎** | sherpa-onnx + Qwen3-ASR | 离线语音识别 (int8 量化，~600M 参数) |
+| **ASR 引擎** | Qwen3-ASR 1.7B GGUF 混合引擎 | ONNX 编码器 + llama.cpp LLM 解码器（~1.7B 参数） |
+| **备选引擎** | sherpa-onnx Qwen3-ASR 0.6B | int8 量化，~600M 参数，更快但精度略低 |
 | **AI 服务** | Python WebSocket Server | ASR 推理服务，自动随应用启停 |
 | **前端** | Vite + Vanilla JS | UI 渲染、波形动画、交互逻辑 |
 | **LLM 集成** | DeepSeek / OpenAI / Ollama | 可选的翻译与文本润色（需用户自行配置 API Key） |
@@ -120,10 +121,12 @@
 
 ### 方式一：下载预编译安装包
 
-前往 [Releases](https://github.com/yourname/caps-writer-desktop/releases) 页面下载最新版本：
+前往 [Releases](https://github.com/archerzing-tech/caps-writer-desktop/releases) 页面下载最新版本：
 
-- **`CapsWriter-Desktop_0.1.0_x64-setup.exe`** — NSIS 安装程序（推荐）
-- **`CapsWriter-Desktop_0.1.0_x64_en-US.msi`** — MSI 安装程序
+- **`CapsWriter-Desktop_0.3.0_x64-setup.exe`** — Windows NSIS 安装程序（推荐）
+- **`CapsWriter-Desktop_0.3.0_x64_en-US.msi`** — Windows MSI 安装程序
+- **`CapsWriter-Desktop_0.3.0_aarch64.dmg`** — macOS Apple Silicon 安装包
+- **`CapsWriter-Desktop_0.3.0_x64.dmg`** — macOS Intel 安装包
 
 > ⚠️ 首次运行需要下载模型文件和安装 Python 依赖（见下方 [模型下载](#模型下载) 和 [Python 环境准备](#python-环境准备)）。
 
@@ -140,16 +143,114 @@
 
 #### 模型下载
 
-模型文件较大（约 600MB），已从 Git 仓库中排除，请手动下载并放置到 `models/` 目录：
+模型文件较大（约 1.2~2.3GB），已从 Git 仓库中排除。你可以通过以下任一方式获取模型：
 
-📥 **百度网盘下载**: https://pan.baidu.com/s/18n5K6q6Jq-xo7RK68wXCmQ?pwd=6666
+##### 方式一：应用内一键下载（推荐）
 
-下载后解压到项目根目录，确保目录结构如下：
+应用启动后，如果检测到模型未安装，会在录音页面显示「⬇ 一键下载模型」按钮。点击即可自动从 HuggingFace 下载所需模型到 `models/` 目录。
+
+> ⚠️ 国内用户如遇下载慢或连接失败，建议使用方式二（手动下载），并使用 HuggingFace 镜像或 ModelScope。
+
+##### 方式二：手动下载
+
+根据你的硬件配置，从以下来源下载模型文件。
+
+---
+
+##### 模型下载来源
+
+##### 1.7B GGUF 混合引擎（Qwen3-ASR 1.7B — 推荐）
+
+混合引擎 = ONNX 编码器 + GGUF LLM 解码器。需要同时下载编码器和解码器文件。
+
+| 文件 | 下载地址 | 说明 |
+|------|---------|------|
+| **ONNX 编码器** | | |
+| `qwen3_asr_encoder_frontend.onnx` | [🤗 cgisky/ai00-x](https://huggingface.co/cgisky/ai00-x/tree/main/asr) | 音频特征提取前端 (~40MB) |
+| `qwen3_asr_encoder_backend.onnx` | [🤗 cgisky/ai00-x](https://huggingface.co/cgisky/ai00-x/tree/main/asr) | 音频编码后端 (~350MB) |
+| **GGUF 解码器** | | |
+| Q4_K_M 量化 | [🤗 mradermacher/Qwen3-ASR-1.7B-GGUF](https://huggingface.co/mradermacher/Qwen3-ASR-1.7B-GGUF) | ~1.4GB，推荐集显 / 低内存 |
+| Q5_K_M 量化 | 同上仓库 | ~1.6GB，推荐独显 (NVIDIA/AMD) |
+| Q8_0 量化 | 同上仓库 | ~2.3GB，最佳精度，需大显存 |
+
+> 🇨🇳 **国内用户**: 可使用 [ModelScope 镜像](https://modelscope.cn/models/qwen/Qwen3-ASR-1.7B) 或 HuggingFace 镜像站（如 `hf-mirror.com`）加速下载。
+>
+> 📌 **重要**: 从 HuggingFace 下载的 GGUF 文件默认命名为 `Qwen3-ASR-1.7B.Q5_K_M.gguf` 等格式。应用已支持自动识别此命名，但如果你使用旧版本，请重命名为 `qwen3_asr_llm.gguf`。
+>
+> ```bash
+> # HuggingFace 镜像示例
+> export HF_ENDPOINT=https://hf-mirror.com
+> huggingface-cli download mradermacher/Qwen3-ASR-1.7B-GGUF \
+>   Qwen3-ASR-1.7B.Q5_K_M.gguf --local-dir models/Qwen3-ASR-1.7B/
+> ```
+
+##### 0.6B int8 轻量引擎（sherpa-onnx）
+
+更小更快，适合低配机器或追求低延迟的场景。
+
+| 文件 | 下载地址 | 说明 |
+|------|---------|------|
+| 完整模型包 | [🤗 csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25](https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25) | 包含所有 ONNX + tokenizer (~850MB) |
+
+---
+
+##### 硬件环境与模型匹配指南
+
+选择合适的模型直接影响识别速度和准确度。以下是详细的匹配建议：
+
+#### 场景一：独立显卡（NVIDIA GTX 1060+ / RTX 系列 / AMD RX 系列）
+
+| 显存 | 推荐模型 | 量化 | 大小 | 预计识别速度 |
+|------|---------|------|------|-------------|
+| ≥ 6GB | **1.7B Q8_0** | 8-bit | ~2.3GB | <0.3x 实时 |
+| ≥ 4GB | **1.7B Q5_K_M** | 5-bit | ~1.6GB | <0.4x 实时 |
+| ≥ 2GB | **1.7B Q4_K_M** | 4-bit | ~1.4GB | <0.5x 实时 |
+
+> 💡 独显用户建议在「设置 → GPU 加速」中选择 **DirectML**（Windows）或 **CoreML**（macOS），可大幅提升推理速度。
+
+#### 场景二：集成显卡 / Apple Silicon（M1/M2/M3/M4）
+
+| 内存 | 推荐模型 | 量化 | 大小 | 预计识别速度 |
+|------|---------|------|------|-------------|
+| ≥ 16GB | **1.7B Q5_K_M** | 5-bit | ~1.6GB | <0.5x 实时 (M系列) |
+| ≥ 8GB | **1.7B Q4_K_M** | 4-bit | ~1.4GB | <0.7x 实时 (M系列) |
+| 8GB | **0.6B int8** | 8-bit | ~850MB | <0.3x 实时 |
+
+> 🍎 Apple Silicon (M1+) 用户：llama.cpp 原生支持 Metal 加速，推理效率极佳。1.7B 模型在 M2/M3 上可达实时甚至超实时识别。
+
+#### 场景三：CPU Only / 低配机器
+
+| 内存 | 推荐模型 | 量化 | 大小 | 预计识别速度 |
+|------|---------|------|------|-------------|
+| ≥ 16GB | **1.7B Q4_K_M** | 4-bit | ~1.4GB | ~1-2x 实时 |
+| ≥ 8GB | **0.6B int8** | 8-bit | ~850MB | ~0.5-1x 实时 |
+| 4-8GB | **0.6B int8** | 8-bit | ~850MB | ~0.8-1.5x 实时 |
+
+> ⚠️ CPU 推理速度取决于核心数和频率。建议至少 4 核处理器。首次加载模型约需 5-15 秒（视磁盘速度）。
+
+#### 量化级别说明
+
+| 量化 | 比特数 | 精度保持 | 内存占用 | 适用场景 |
+|------|--------|---------|---------|---------|
+| **Q8_0** | 8-bit | ~99.5% | 大 | 大显存独显，追求最高精度 |
+| **Q5_K_M** | 5-bit | ~98.5% | 中 | 独显 / 高性能集显，推荐日常使用 |
+| **Q4_K_M** | 4-bit | ~97% | 小 | 集成显卡 / CPU，内存受限环境 |
+| **int8** (sherpa) | 8-bit | — | ~850MB | 轻量级场景，低配机器 |
+
+---
+
+##### 📁 下载后配置
+
+解压或下载文件后，确保 `models/` 目录结构如下：
 
 ```
 caps-writer-desktop/
 ├── models/
-│   └── sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/
+│   ├── Qwen3-ASR-1.7B/               # ← 1.7B GGUF 混合引擎（推荐）
+│   │   ├── qwen3_asr_encoder_frontend.onnx   # 从 cgisky/ai00-x 下载
+│   │   ├── qwen3_asr_encoder_backend.onnx    # 从 cgisky/ai00-x 下载
+│   │   └── qwen3_asr_llm.gguf               # 从 mradermacher/GGUF 下载（任意量化）
+│   └── sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/  # 可选
 │       ├── conv_frontend.onnx
 │       ├── encoder.int8.onnx
 │       ├── decoder.int8.onnx
@@ -157,31 +258,31 @@ caps-writer-desktop/
 └── ...
 ```
 
+> 📌 **多量化并存**: 可以将不同量化的 `.gguf` 文件放入同一目录（如 `Qwen3-ASR-1.7B.Q5_K_M.gguf` + `Qwen3-ASR-1.7B.Q4_K_M.gguf`）。应用会按精度从高到低搜索匹配（Q8_0 → Q5_K → Q4_K → 任意 .gguf），找到的第一个文件即为当前使用的模型。如需切换量化，重命名不需要的文件前缀即可。
+
+> 📌 **自定义模型目录**: 如果不想将模型放在项目目录，可在「设置 → 识别引擎」中指定自定义路径。
+
 #### 克隆并构建
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/yourname/caps-writer-desktop.git
+git clone https://github.com/archerzing-tech/caps-writer-desktop.git
 cd caps-writer-desktop
 
 # 2. 安装前端依赖
 npm install
 
-# 3. 安装 Python 依赖（ASR 服务端）
-pip install numpy websockets
+# 3. 安装 Python 依赖（ASR 服务端，详见下方 Python 环境准备）
+cd sidecar && pip install -r requirements.txt && cd ..
 
-# 4. （可选）安装 sherpa-onnx 以启用真实 ASR 引擎
-# pip install sherpa-onnx
-# 不安装 sherpa-onnx 时，应用会使用 Mock 引擎（返回测试文本）
-
-# 5. 开发模式运行
+# 4. 开发模式运行
 npm run dev
 
-# 6. 或构建生产版本
+# 5. 或构建生产版本
 npm run build
 ```
 
-构建产物位于：`src-tauri/target/release/bundle/`
+> 📦 模型下载请参见上方 [📦 模型下载来源](#-模型下载来源) 章节。
 
 #### Python 环境准备
 
@@ -193,6 +294,10 @@ pip install -r requirements.txt
 ```
 
 > 💡 应用启动时会自动查找 `python` 命令，请确保 Python 已添加到系统 PATH。
+> 首次启动时，1.7B GGUF 模型加载约需 5~10 秒（视磁盘速度而定）。
+> macOS 用户需要预先编译 llama.cpp 依赖（macOS 的 `.dylib` 已预编译在 `sidecar/server/llama/` 目录下，通常无需额外操作）。
+
+构建产物位于：`src-tauri/target/release/bundle/`
 
 ---
 
@@ -241,8 +346,8 @@ pip install -r requirements.txt
 
 | 设置项 | 说明 |
 |--------|------|
-| 识别引擎 | 选择 ASR 模型（默认 Qwen3-ASR） |
-| 识别语言 | 自动检测 / 中文 / 英文 / 日文 |
+| 识别引擎 | Qwen3-ASR 1.7B GGUF 混合引擎 / sherpa-onnx 0.6B |
+| 识别语言 | 自动检测 / 中文 / 英文 |
 | GPU 加速 | CPU 或 DirectML (GPU) |
 | 数字格式化 | 十五六 → 15~16 |
 | 热词管理 | 编辑热词列表（支持 `原词 -> 替换词` 格式） |
@@ -287,8 +392,19 @@ caps-writer-desktop/
 │   └── server/
 │       ├── server.py             #   WebSocket ASR 服务
 │       ├── asr_engine.py         #   ASR 引擎抽象层
-│       └── protocol.py           #   通信协议定义
+│       ├── qwen_asr_gguf.py      #   GGUF 混合引擎
+│       ├── qwen_encoder.py       #   ONNX 音频编码器
+│       ├── llama_bindings.py     #   llama.cpp ctypes 绑定
+│       ├── protocol.py           #   通信协议定义
+│       └── llama/                #   编译好的 llama.cpp dylib
+│           ├── libllama.dylib
+│           └── libggml*.dylib
 ├── models/                       # 预训练模型
+│   ├── Qwen3-ASR-1.7B/           # 1.7B GGUF 混合引擎
+│   │   ├── qwen3_asr_encoder_frontend.onnx
+│   │   ├── qwen3_asr_encoder_backend.onnx
+│   │   ├── qwen3_asr_llm.gguf
+│   │   └── qwen3_asr_llm.q4_k.gguf
 │   └── sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/
 │       ├── conv_frontend.onnx
 │       ├── encoder.int8.onnx
@@ -325,7 +441,7 @@ caps-writer-desktop/
 
 ```bash
 # Fork 并克隆
-git clone https://github.com/yourname/caps-writer-desktop.git
+git clone https://github.com/archerzing-tech/caps-writer-desktop.git
 
 # 创建特性分支
 git checkout -b feature/amazing-feature
@@ -354,8 +470,9 @@ npm run dev
 
 ## 🙏 致谢
 
-- [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline) — 原版 CapsWriter 灵感来源
-- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — 本地 ASR 推理引擎
+- [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline) — 原版 CapsWriter + GGUF 混合引擎方案灵感来源
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — 备选 ASR 推理引擎
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) — LLM 推理框架
 - [Tauri](https://tauri.app) — 跨平台桌面应用框架
 - [Qwen3-ASR](https://github.com/QwenLM) — 通义千问语音识别模型
 

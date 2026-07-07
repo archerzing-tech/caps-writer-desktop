@@ -76,6 +76,7 @@ pub fn run() {
             load_config,
             copy_to_clipboard,
             pick_audio_file,
+            pick_model_dir,
             export_transcriptions,
             save_history,
             get_history_dates,
@@ -90,6 +91,8 @@ pub fn run() {
             load_llm_config,
             load_hotwords,
             save_hotwords,
+            download_qwen3_asr_model,
+            check_model_status,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
